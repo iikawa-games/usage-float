@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.lnk
+
+# Local helpers / probes (never publish)
+_tmp_*.py
+_probe_*.py
+
+# User runtime
+.usage-float/
+usage-cache.json
+
+# Captured private desktops
+docs/screenshots/_raw/
+docs/screenshots/panel_printwindow.png
+docs/screenshots/_shot_log.txt
+
+# mpv is downloaded by install-mpv.ps1
+vendor/mpv/*.exe
+vendor/mpv/*.dll
+vendor/mpv/LICENSE.GPL
+vendor/mpv/Copyright
