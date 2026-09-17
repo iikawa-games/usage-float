@@ -116,7 +116,7 @@ python usage_float.py autostart on  # 开机自启
 - `x-litellm-key-spend`
 - `x-litellm-key-max-budget`
 
-面板显示 `$已用/$额度` 和重置倒计时。虚拟 key 通常读不到 `/key/info`，倒计时按 LiteLLM 的月度规则（每月 1 日 0:00，默认 UTC）。可用 `LLM_PROXY_BUDGET_DURATION` / `LLM_PROXY_TIMEZONE`，或配置里的 `llm_proxy_budget_duration` / `llm_proxy_timezone` 覆盖。没配 key 就不显示这一行。
+面板显示 `$已用/$额度` 和重置倒计时。虚拟 key 通常读不到 `/key/info`，倒计时默认按 LiteLLM 的周规则（每周一 0:00，UTC）。可用 `LLM_PROXY_BUDGET_DURATION` / `LLM_PROXY_TIMEZONE`，或配置里的 `llm_proxy_budget_duration` / `llm_proxy_timezone` 覆盖。没配 key 就不显示这一行。
 
 ## 配置
 
@@ -136,7 +136,7 @@ python usage_float.py autostart on  # 开机自启
   "wallpaper_audio": true,
   "llm_proxy_api_key": "",
   "llm_proxy_endpoint": "",
-  "llm_proxy_budget_duration": "30d",
+  "llm_proxy_budget_duration": "7d",
   "llm_proxy_timezone": "UTC"
 }
 ```

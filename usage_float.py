@@ -139,9 +139,9 @@ GROK_BILLING_URL = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCredits
 LLM_PROXY_DEFAULT_ENDPOINT = ""
 LLM_PROXY_EMBED_MODEL = "gemini-embedding-2"
 LLM_PROXY_CHAT_FALLBACK_MODEL = "glm-5.3-flash"
-# Virtual keys often cannot call /key/info. LiteLLM 30d/1mo budgets reset on the
-# 1st of the month at midnight in the proxy timezone (UTC unless configured).
-LLM_PROXY_BUDGET_DURATION_DEFAULT = "30d"
+# Virtual keys often cannot call /key/info. Weekly (7d) budgets reset Monday
+# midnight in the proxy timezone (UTC unless configured).
+LLM_PROXY_BUDGET_DURATION_DEFAULT = "7d"
 LLM_PROXY_TIMEZONE_DEFAULT = "UTC"
 LLM_PROXY_RESET_HEADERS = (
     "x-litellm-key-budget-reset-at",

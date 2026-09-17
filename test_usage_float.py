@@ -968,7 +968,7 @@ class LlmProxyUsageTests(unittest.TestCase):
         ), patch.object(
             usage_float_module, "_llm_proxy_probe", fake_probe
         ), patch.object(
-            usage_float_module, "_llm_proxy_budget_settings", return_value=("30d", "UTC")
+            usage_float_module, "_llm_proxy_budget_settings", return_value=("7d", "UTC")
         ), patch.object(usage_float_module, "cache_put_provider", lambda _p: None):
             usage = usage_float_module.fetch_llmproxy_usage()
 
@@ -982,6 +982,19 @@ class LlmProxyUsageTests(unittest.TestCase):
         self.assertEqual(rows[0].summary, "$20/200")
         self.assertIsNotNone(rows[0].resets_at)
         self.assertTrue(format_remaining(rows[0].resets_at))
+
+    def test_default_budget_duration_is_weekly(self) -> None:
+        self.assertEqual(usage_float_module.LLM_PROXY_BUDGET_DURATION_DEFAULT, "7d")
+        with patch.object(
+            usage_float_module, "CONFIG_PATH", Path("/missing.json")
+        ), patch.dict(
+            "os.environ",
+            {"LLM_PROXY_BUDGET_DURATION": "", "LLM_PROXY_TIMEZONE": ""},
+            clear=False,
+        ):
+            duration, timezone_name = usage_float_module._llm_proxy_budget_settings()
+        self.assertEqual(duration, "7d")
+        self.assertEqual(timezone_name, "UTC")
 
     def test_monthly_budget_resets_on_the_first(self) -> None:
         now = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
