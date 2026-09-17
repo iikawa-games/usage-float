@@ -67,7 +67,7 @@ python usage_float.py autostart on  # 开机自启
 | 点击 Codex 用量数字 | 弹出该账号的重置卡列表 |
 | 拖动 | 移动悬浮窗 |
 | 右键 | 刷新 / 设置 / 切换专用副屏 / 置顶 / 开机自启 / 退出 |
-| 连续按两次 Ctrl | 用量仪表盘 ↔ 动态壁纸；Ctrl+C / Ctrl+V 不会触发 |
+| 快捷键（默认连按两次 Ctrl） | 用量仪表盘 ↔ 动态壁纸；可在设置里改成连按 N 次或组合键 |
 | `F5` | 刷新 |
 | `Esc` | 退出 |
 | `Home` | 复位到主屏角落 |
@@ -80,11 +80,11 @@ python usage_float.py autostart on  # 开机自启
 - **勾选「显示」**：只把勾上的用量画到面板上；空格键也可切换当前行
 - **拖动行**：按住名称或状态列上下拖，调整面板顺序（点第一列是勾选，不是拖动）
 
-未登录的 provider 即使勾选了也不会占位，登录之后才会出现。勾选和顺序写在 `~/.usage-float/config.json` 的 `providers` / `provider_order` / `disabled_providers`，一般用设置页改即可。
+未登录的 provider 即使勾选了也不会占位，登录之后才会出现。勾选和顺序写在 `~/.usage-float/config.json` 的 `providers` / `provider_order` / `disabled_providers`，一般用设置页改即可。LLM Proxy 的重置时区也在这一页，默认 UTC+8。
 
 ## 专用副屏
 
-右键 → **设置…** → **副屏** → 选中目标显示器 → 打开「专用副屏模式」。程序用显示器硬件标识锁定副屏，重新插拔后会再铺满该屏；显示器被拔掉时临时退回悬浮窗。
+右键 → **设置…** → **副屏** → 选中目标显示器 → 打开「专用副屏模式」。程序用显示器硬件标识锁定副屏，重新插拔后会再铺满该屏；显示器被拔掉时临时退回悬浮窗。同一页可设置快捷键：连按（默认两次 Ctrl）或组合键。
 
 ## 动态壁纸
 
@@ -93,7 +93,7 @@ python usage_float.py autostart on  # 开机自启
 - 支持常见 JPG / PNG / WebP / GIF / MP4 / WebM / MKV / MOV，含子目录
 - 每次进入随机首项；30 分钟以内的视频从 0:00 播，更长的优先随机章节、没有章节则随机时间
 - 图片默认停留 10 秒（2–300 秒可调）
-- 双击 Ctrl 切回用量时 mpv 进程退出，不留后台解码
+- 快捷键切回用量时 mpv 进程退出，不留后台解码
 - 可给子目录加权；竖图居中裁成正方形，横图和视频铺满副屏
 - 点击副屏后：视频左右键 ±5 秒，图片左右键上一张/下一张，滚轮调音量
 - 可把视频拖到副屏立即播放，结束后回到轮播
@@ -116,7 +116,7 @@ python usage_float.py autostart on  # 开机自启
 - `x-litellm-key-spend`
 - `x-litellm-key-max-budget`
 
-面板显示 `$已用/$额度` 和重置倒计时。虚拟 key 通常读不到 `/key/info`，倒计时默认按 LiteLLM 的周规则（每周一 0:00，UTC）。可用 `LLM_PROXY_BUDGET_DURATION` / `LLM_PROXY_TIMEZONE`，或配置里的 `llm_proxy_budget_duration` / `llm_proxy_timezone` 覆盖。没配 key 就不显示这一行。
+面板显示 `$已用/$额度` 和重置倒计时。虚拟 key 通常读不到 `/key/info`，倒计时默认按 LiteLLM 的周规则（每周一 0:00，UTC+8）。时区在设置 → **用量** 里改，也可用 `LLM_PROXY_TIMEZONE` 或 `llm_proxy_timezone`。没配 key 就不显示这一行。
 
 ## 配置
 
@@ -130,14 +130,18 @@ python usage_float.py autostart on  # 开机自启
   "disabled_providers": [],
   "refresh_seconds": 300,
   "display_mode": "panel",
-  "double_ctrl_toggle": true,
+  "shortcut_enabled": true,
+  "shortcut_mode": "repeat",
+  "shortcut_key": "ctrl",
+  "shortcut_repeat_count": 2,
+  "shortcut_combo": ["ctrl", "alt"],
   "wallpaper_folders": ["D:\\Wallpapers"],
   "wallpaper_image_seconds": 10,
   "wallpaper_audio": true,
   "llm_proxy_api_key": "",
   "llm_proxy_endpoint": "",
   "llm_proxy_budget_duration": "7d",
-  "llm_proxy_timezone": "UTC"
+  "llm_proxy_timezone": "UTC+8"
 }
 ```
 

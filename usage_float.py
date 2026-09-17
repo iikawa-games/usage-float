@@ -43,7 +43,7 @@ APP_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", HOME / ".claude"))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 CODEX_HOME_2 = Path(os.environ.get("CODEX_HOME_2", HOME / ".codex-2"))
@@ -140,9 +140,9 @@ LLM_PROXY_DEFAULT_ENDPOINT = ""
 LLM_PROXY_EMBED_MODEL = "gemini-embedding-2"
 LLM_PROXY_CHAT_FALLBACK_MODEL = "glm-5.3-flash"
 # Virtual keys often cannot call /key/info. Weekly (7d) budgets reset Monday
-# midnight in the proxy timezone (UTC unless configured).
+# midnight in the proxy timezone (UTC+8 unless configured).
 LLM_PROXY_BUDGET_DURATION_DEFAULT = "7d"
-LLM_PROXY_TIMEZONE_DEFAULT = "UTC"
+LLM_PROXY_TIMEZONE_DEFAULT = "UTC+8"
 LLM_PROXY_RESET_HEADERS = (
     "x-litellm-key-budget-reset-at",
     "x-litellm-budget-reset-at",
@@ -174,7 +174,28 @@ DISPLAY_MODE_PANEL = "panel"
 MONITOR_POLL_MS = 3000
 DOUBLE_CTRL_INTERVAL_SECONDS = 0.45
 DOUBLE_CTRL_POLL_MS = 20
+SHORTCUT_MODE_REPEAT = "repeat"
+SHORTCUT_MODE_COMBO = "combo"
+SHORTCUT_KEY_DEFAULT = "ctrl"
+SHORTCUT_REPEAT_COUNT_DEFAULT = 2
+SHORTCUT_REPEAT_COUNT_MIN = 2
+SHORTCUT_REPEAT_COUNT_MAX = 8
+SHORTCUT_COMBO_DEFAULT: tuple[str, ...] = ("ctrl", "alt")
 CTRL_VIRTUAL_KEYS = frozenset((0x11, 0xA2, 0xA3))
+_MODIFIER_VIRTUAL_KEYS: dict[str, tuple[int, ...]] = {
+    "ctrl": (0x11, 0xA2, 0xA3),
+    "shift": (0x10, 0xA0, 0xA1),
+    "alt": (0x12, 0xA4, 0xA5),
+    "win": (0x5B, 0x5C),
+}
+_NAMED_VIRTUAL_KEYS: dict[str, tuple[int, ...]] = {
+    **_MODIFIER_VIRTUAL_KEYS,
+    "esc": (0x1B,),
+    "escape": (0x1B,),
+    "tab": (0x09,),
+    "space": (0x20,),
+    "enter": (0x0D,),
+}
 # IME state/mode virtual keys can remain reported as physically down by
 # GetAsyncKeyState (notably VK_KANJI=0x19 with Sogou). They are not real
 # Ctrl combinations and must not poison double-Ctrl detection.
@@ -245,56 +266,228 @@ OPACITY_MIN = 5
 OPACITY_MAX = 100
 
 
+def _canonical_key_name(raw: str | None) -> str:
+    text = (raw or "").strip().lower()
+    aliases = {
+        "control": "ctrl",
+        "ctl": "ctrl",
+        "vk_control": "ctrl",
+        "option": "alt",
+        "meta": "win",
+        "super": "win",
+        "windows": "win",
+        "return": "enter",
+        "escape": "esc",
+    }
+    return aliases.get(text, text)
+
+
+def _vk_codes_for_key(name: str) -> tuple[int, ...]:
+    key = _canonical_key_name(name)
+    if not key:
+        return ()
+    if key in _NAMED_VIRTUAL_KEYS:
+        return _NAMED_VIRTUAL_KEYS[key]
+    if len(key) == 1 and "a" <= key <= "z":
+        return (ord(key.upper()),)
+    if len(key) == 1 and "0" <= key <= "9":
+        return (ord(key),)
+    if key.startswith("f") and key[1:].isdigit():
+        index = int(key[1:])
+        if 1 <= index <= 24:
+            return (0x70 + index - 1,)
+    return ()
+
+
+def _named_key_down(get_key_state: Callable[[int], int], name: str) -> bool:
+    return any(bool(get_key_state(vk) & 0x8000) for vk in _vk_codes_for_key(name))
+
+
+def _shortcut_keys_currently_down(get_key_state: Callable[[int], int]) -> list[str]:
+    found: list[str] = []
+    for name in ("ctrl", "shift", "alt", "win"):
+        if _named_key_down(get_key_state, name):
+            found.append(name)
+    for code in range(ord("A"), ord("Z") + 1):
+        name = chr(code).lower()
+        if _named_key_down(get_key_state, name):
+            found.append(name)
+    for code in range(ord("0"), ord("9") + 1):
+        name = chr(code)
+        if _named_key_down(get_key_state, name):
+            found.append(name)
+    for index in range(1, 13):
+        name = f"f{index}"
+        if _named_key_down(get_key_state, name):
+            found.append(name)
+    for name in ("esc", "tab", "space", "enter"):
+        if _named_key_down(get_key_state, name) and name not in found:
+            found.append(name)
+    return found
+
+
+def _normalize_shortcut_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {SHORTCUT_MODE_COMBO, "chord", "hotkey", "组合", "组合键"}:
+        return SHORTCUT_MODE_COMBO
+    return SHORTCUT_MODE_REPEAT
+
+
+def _normalize_shortcut_key(value: Any) -> str:
+    key = _canonical_key_name(str(value or ""))
+    if key in _MODIFIER_VIRTUAL_KEYS:
+        return key
+    return SHORTCUT_KEY_DEFAULT
+
+
+def _normalize_shortcut_repeat_count(value: Any) -> int:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = SHORTCUT_REPEAT_COUNT_DEFAULT
+    return max(SHORTCUT_REPEAT_COUNT_MIN, min(SHORTCUT_REPEAT_COUNT_MAX, count))
+
+
+def _normalize_shortcut_combo(value: Any) -> list[str]:
+    if isinstance(value, str):
+        parts = [
+            _canonical_key_name(part)
+            for part in value.replace("+", " ").replace("-", " ").split()
+        ]
+    elif isinstance(value, (list, tuple)):
+        parts = [_canonical_key_name(str(part)) for part in value]
+    else:
+        parts = []
+    seen: list[str] = []
+    for part in parts:
+        if not part or part in seen or not _vk_codes_for_key(part):
+            continue
+        seen.append(part)
+    order = list(_MODIFIER_VIRTUAL_KEYS)
+    mods = [name for name in order if name in seen]
+    rest = [name for name in seen if name not in order]
+    normalized = mods + rest
+    return normalized if len(normalized) >= 2 else list(SHORTCUT_COMBO_DEFAULT)
+
+
+def _format_shortcut_combo(keys: list[str] | tuple[str, ...]) -> str:
+    labels = {
+        "ctrl": "Ctrl",
+        "shift": "Shift",
+        "alt": "Alt",
+        "win": "Win",
+        "esc": "Esc",
+        "tab": "Tab",
+        "space": "Space",
+        "enter": "Enter",
+    }
+    return "+".join(labels.get(name, name.upper()) for name in keys)
+
+
+def _normalize_shortcut_config(data: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw = data if isinstance(data, dict) else {}
+    enabled = raw.get("shortcut_enabled")
+    if enabled is None:
+        enabled = raw.get("double_ctrl_toggle", True)
+    return {
+        "shortcut_enabled": bool(enabled),
+        "shortcut_mode": _normalize_shortcut_mode(raw.get("shortcut_mode")),
+        "shortcut_key": _normalize_shortcut_key(raw.get("shortcut_key")),
+        "shortcut_repeat_count": _normalize_shortcut_repeat_count(
+            raw.get("shortcut_repeat_count")
+        ),
+        "shortcut_combo": _normalize_shortcut_combo(raw.get("shortcut_combo")),
+        "double_ctrl_toggle": bool(enabled),
+    }
+
+
 @dataclass
-class _DoubleCtrlDetector:
-    """State machine for two clean Ctrl taps without swallowing key events."""
+class _RepeatKeyDetector:
+    """N clean taps of one key, ignoring combos like Ctrl+C."""
 
     interval_seconds: float = DOUBLE_CTRL_INTERVAL_SECONDS
-    ctrl_down: bool = False
+    tap_count: int = SHORTCUT_REPEAT_COUNT_DEFAULT
+    key_down: bool = False
     press_used: bool = False
-    last_tap_at: float | None = None
+    taps: list[float] = field(default_factory=list)
 
     def reset(self) -> None:
-        self.ctrl_down = False
+        self.key_down = False
         self.press_used = False
-        self.last_tap_at = None
+        self.taps.clear()
 
-    def update(self, ctrl_down: bool, other_key_down: bool, now: float) -> bool:
-        if ctrl_down:
-            if not self.ctrl_down:
+    def update(self, key_down: bool, other_key_down: bool, now: float) -> bool:
+        needed = max(1, int(self.tap_count))
+        if key_down:
+            if not self.key_down:
                 self.press_used = bool(other_key_down)
             elif other_key_down:
                 self.press_used = True
-            self.ctrl_down = True
+            self.key_down = True
             return False
 
-        if not self.ctrl_down:
-            if (
-                self.last_tap_at is not None
-                and now - self.last_tap_at > self.interval_seconds
-            ):
-                self.last_tap_at = None
+        if not self.key_down:
+            if self.taps and now - self.taps[-1] > self.interval_seconds:
+                self.taps.clear()
             return False
 
-        self.ctrl_down = False
+        self.key_down = False
         if self.press_used:
             self.press_used = False
-            self.last_tap_at = None
+            self.taps.clear()
             return False
 
-        if (
-            self.last_tap_at is not None
-            and 0.0 <= now - self.last_tap_at <= self.interval_seconds
+        if self.taps and now - self.taps[-1] > self.interval_seconds:
+            self.taps.clear()
+        self.taps.append(now)
+        if len(self.taps) < needed:
+            return False
+        recent = self.taps[-needed:]
+        if all(
+            0.0 <= recent[index + 1] - recent[index] <= self.interval_seconds
+            for index in range(needed - 1)
         ):
-            self.last_tap_at = None
+            self.taps.clear()
             return True
-
-        self.last_tap_at = now
         return False
 
 
-def _other_shortcut_key_down(get_key_state: Callable[[int], int]) -> bool:
-    excluded = CTRL_VIRTUAL_KEYS | IME_STATE_VIRTUAL_KEYS
+class _DoubleCtrlDetector(_RepeatKeyDetector):
+    """Back-compat name for the default two-tap Ctrl detector."""
+
+    @property
+    def ctrl_down(self) -> bool:
+        return self.key_down
+
+    @property
+    def last_tap_at(self) -> float | None:
+        return self.taps[-1] if self.taps else None
+
+
+@dataclass
+class _ComboKeyDetector:
+    held: bool = False
+
+    def reset(self) -> None:
+        self.held = False
+
+    def update(self, active: bool) -> bool:
+        if active:
+            if self.held:
+                return False
+            self.held = True
+            return True
+        self.held = False
+        return False
+
+
+def _other_shortcut_key_down(
+    get_key_state: Callable[[int], int],
+    exclude_keys: list[str] | None = None,
+) -> bool:
+    excluded = set(IME_STATE_VIRTUAL_KEYS)
+    for name in exclude_keys if exclude_keys is not None else ["ctrl"]:
+        excluded.update(_vk_codes_for_key(name))
     return any(
         bool(get_key_state(vk) & 0x8000)
         for vk in range(1, 256)
@@ -1537,6 +1730,13 @@ def load_config() -> dict[str, Any]:
         "monitor_device": None,
         "monitor_id": None,
         "double_ctrl_toggle": True,
+        "shortcut_enabled": True,
+        "shortcut_mode": SHORTCUT_MODE_REPEAT,
+        "shortcut_key": SHORTCUT_KEY_DEFAULT,
+        "shortcut_repeat_count": SHORTCUT_REPEAT_COUNT_DEFAULT,
+        "shortcut_combo": list(SHORTCUT_COMBO_DEFAULT),
+        "llm_proxy_budget_duration": LLM_PROXY_BUDGET_DURATION_DEFAULT,
+        "llm_proxy_timezone": LLM_PROXY_TIMEZONE_DEFAULT,
         "wallpaper_folder": None,
         "wallpaper_folders": [],
         "wallpaper_disabled_folders": [],
@@ -1588,8 +1788,14 @@ def load_config() -> dict[str, Any]:
     )
     monitor_id = defaults.get("monitor_id")
     defaults["monitor_id"] = str(monitor_id).strip() if monitor_id else None
-    defaults["double_ctrl_toggle"] = bool(
-        defaults.get("double_ctrl_toggle", True)
+    shortcut = _normalize_shortcut_config(defaults)
+    defaults.update(shortcut)
+    defaults["llm_proxy_budget_duration"] = (
+        str(defaults.get("llm_proxy_budget_duration") or "").strip()
+        or LLM_PROXY_BUDGET_DURATION_DEFAULT
+    )
+    defaults["llm_proxy_timezone"] = _normalize_llm_proxy_timezone(
+        defaults.get("llm_proxy_timezone")
     )
     wallpaper_folders = _normalize_wallpaper_folders(
         defaults.get("wallpaper_folders"),
@@ -1655,6 +1861,11 @@ def load_config() -> dict[str, Any]:
         defaults["display_mode"] = DISPLAY_MODE_FLOAT
         defaults["always_on_top"] = False
         defaults["double_ctrl_toggle"] = True
+        defaults["shortcut_enabled"] = True
+        defaults["shortcut_mode"] = SHORTCUT_MODE_REPEAT
+        defaults["shortcut_key"] = SHORTCUT_KEY_DEFAULT
+        defaults["shortcut_repeat_count"] = SHORTCUT_REPEAT_COUNT_DEFAULT
+        defaults["shortcut_combo"] = list(SHORTCUT_COMBO_DEFAULT)
         weights: dict[str, int] = {}
         ordered = [root, *(sorted(root.iterdir()) if root.exists() else [])]
         values = (100, 100, 100, 10)
@@ -2005,7 +2216,7 @@ def http_json_response(
     timeout: float = 20.0,
 ) -> tuple[int, Any, dict[str, str]]:
     data = None
-    req_headers = {"Accept": "application/json", "User-Agent": "usage-float/1.1"}
+    req_headers = {"Accept": "application/json", "User-Agent": "usage-float/1.2"}
     if headers:
         req_headers.update(headers)
     if body is not None:
@@ -2884,14 +3095,77 @@ def parse_llm_proxy_spend_headers(
     return spend, budget, cost
 
 
+def _parse_utc_offset(text: str) -> timedelta | None:
+    raw = text.strip().upper().replace(" ", "")
+    if raw in {"UTC", "GMT", "Z"}:
+        return timedelta(0)
+    if raw.startswith("UTC"):
+        raw = raw[3:]
+    if not raw or raw[0] not in "+-":
+        return None
+    sign = 1 if raw[0] == "+" else -1
+    rest = raw[1:]
+    hours = 0
+    minutes = 0
+    if ":" in rest:
+        hour_text, minute_text = rest.split(":", 1)
+        if not hour_text.isdigit() or not minute_text.isdigit():
+            return None
+        hours, minutes = int(hour_text), int(minute_text)
+    elif rest.isdigit():
+        if len(rest) <= 2:
+            hours = int(rest)
+        elif len(rest) == 4:
+            hours, minutes = int(rest[:2]), int(rest[2:])
+        else:
+            return None
+    else:
+        return None
+    if hours > 14 or minutes > 59:
+        return None
+    return timedelta(hours=sign * hours, minutes=sign * minutes)
+
+
+def _normalize_llm_proxy_timezone(value: Any) -> str:
+    text = str(value or "").strip() or LLM_PROXY_TIMEZONE_DEFAULT
+    aliases = {
+        "cst": "UTC+8",
+        "prc": "UTC+8",
+        "asia/shanghai": "UTC+8",
+        "asia/hong_kong": "UTC+8",
+        "asia/taipei": "UTC+8",
+        "asia/singapore": "UTC+8",
+        "asia/tokyo": "UTC+9",
+        "asia/seoul": "UTC+9",
+        "us/eastern": "UTC-5",
+        "us/pacific": "UTC-8",
+        "europe/london": "UTC",
+    }
+    mapped = aliases.get(text.lower())
+    if mapped:
+        return mapped
+    offset = _parse_utc_offset(text)
+    if offset is not None:
+        total_minutes = int(offset.total_seconds() // 60)
+        if total_minutes == 0:
+            return "UTC"
+        sign = "+" if total_minutes > 0 else "-"
+        hours, minutes = divmod(abs(total_minutes), 60)
+        if minutes:
+            return f"UTC{sign}{hours:02d}:{minutes:02d}"
+        return f"UTC{sign}{hours}"
+    return text
+
+
 def _llm_proxy_zoneinfo(name: str | None) -> timezone | ZoneInfo:
-    text = (name or LLM_PROXY_TIMEZONE_DEFAULT).strip() or LLM_PROXY_TIMEZONE_DEFAULT
-    if text.upper() == "UTC":
-        return timezone.utc
+    text = _normalize_llm_proxy_timezone(name)
+    offset = _parse_utc_offset(text)
+    if offset is not None:
+        return timezone(offset)
     try:
         return ZoneInfo(text)
     except Exception:
-        return timezone.utc
+        return timezone(timedelta(hours=8))
 
 
 def _normalize_llm_proxy_budget_duration(raw: str | None) -> str:
@@ -3011,7 +3285,7 @@ def _llm_proxy_budget_settings() -> tuple[str, str]:
         pass
     return (
         duration or LLM_PROXY_BUDGET_DURATION_DEFAULT,
-        timezone_name or LLM_PROXY_TIMEZONE_DEFAULT,
+        _normalize_llm_proxy_timezone(timezone_name or LLM_PROXY_TIMEZONE_DEFAULT),
     )
 
 
@@ -4092,7 +4366,17 @@ def run_ui() -> None:
         "panel_structure": None,
         "panel_items": [],
         "panel_empty_label": None,
-        "double_ctrl_toggle": bool(cfg.get("double_ctrl_toggle", True)),
+        "double_ctrl_toggle": bool(cfg.get("shortcut_enabled", cfg.get("double_ctrl_toggle", True))),
+        "shortcut_enabled": bool(cfg.get("shortcut_enabled", cfg.get("double_ctrl_toggle", True))),
+        "shortcut_mode": _normalize_shortcut_mode(cfg.get("shortcut_mode")),
+        "shortcut_key": _normalize_shortcut_key(cfg.get("shortcut_key")),
+        "shortcut_repeat_count": _normalize_shortcut_repeat_count(
+            cfg.get("shortcut_repeat_count")
+        ),
+        "shortcut_combo": _normalize_shortcut_combo(cfg.get("shortcut_combo")),
+        "llm_proxy_timezone": _normalize_llm_proxy_timezone(
+            cfg.get("llm_proxy_timezone")
+        ),
         "double_ctrl_job": None,
         "wallpaper_active": False,
         "wallpaper_folder": cfg.get("wallpaper_folder"),
@@ -4123,7 +4407,10 @@ def run_ui() -> None:
         "wallpaper_drop_cleanup": None,
     }
 
-    double_ctrl_detector = _DoubleCtrlDetector()
+    repeat_detector = _RepeatKeyDetector(
+        tap_count=_normalize_shortcut_repeat_count(cfg.get("shortcut_repeat_count"))
+    )
+    combo_detector = _ComboKeyDetector()
     wallpaper_player = _MpvWallpaperPlayer()
     get_async_key_state: Any = None
     if sys.platform == "win32":
@@ -4210,16 +4497,45 @@ def run_ui() -> None:
                 pass
         state["panel_rect_job"] = root.after(delay_ms, enforce_native_panel_rect)
 
-    def set_double_ctrl_toggle(enabled: bool, *, persist: bool = True) -> None:
-        state["double_ctrl_toggle"] = bool(enabled)
-        double_ctrl_detector.reset()
-        if not enabled and state.get("wallpaper_preparing") and not state.get("wallpaper_active"):
+    def apply_shortcut_config(
+        *,
+        enabled: bool | None = None,
+        mode: str | None = None,
+        key: str | None = None,
+        repeat_count: int | None = None,
+        combo: list[str] | None = None,
+        persist: bool = True,
+    ) -> None:
+        if enabled is not None:
+            state["shortcut_enabled"] = bool(enabled)
+            state["double_ctrl_toggle"] = bool(enabled)
+        if mode is not None:
+            state["shortcut_mode"] = _normalize_shortcut_mode(mode)
+        if key is not None:
+            state["shortcut_key"] = _normalize_shortcut_key(key)
+        if repeat_count is not None:
+            state["shortcut_repeat_count"] = _normalize_shortcut_repeat_count(repeat_count)
+        if combo is not None:
+            state["shortcut_combo"] = _normalize_shortcut_combo(combo)
+        repeat_detector.tap_count = int(state["shortcut_repeat_count"])
+        repeat_detector.reset()
+        combo_detector.reset()
+        enabled_now = bool(state.get("shortcut_enabled"))
+        if not enabled_now and state.get("wallpaper_preparing") and not state.get("wallpaper_active"):
             _clear_wallpaper_state()
-        elif enabled:
+        elif enabled_now:
             _schedule_background_wallpaper_prepare()
-        cfg["double_ctrl_toggle"] = bool(enabled)
+        cfg["shortcut_enabled"] = enabled_now
+        cfg["double_ctrl_toggle"] = enabled_now
+        cfg["shortcut_mode"] = str(state["shortcut_mode"])
+        cfg["shortcut_key"] = str(state["shortcut_key"])
+        cfg["shortcut_repeat_count"] = int(state["shortcut_repeat_count"])
+        cfg["shortcut_combo"] = list(state["shortcut_combo"])
         if persist:
             save_config(cfg)
+
+    def set_double_ctrl_toggle(enabled: bool, *, persist: bool = True) -> None:
+        apply_shortcut_config(enabled=enabled, persist=persist)
 
     def _cancel_wallpaper_check() -> None:
         job = state.get("wallpaper_check_job")
@@ -4609,20 +4925,43 @@ def run_ui() -> None:
     def poll_double_ctrl_toggle() -> None:
         state["double_ctrl_job"] = None
         try:
-            if not state.get("double_ctrl_toggle") or get_async_key_state is None:
-                double_ctrl_detector.reset()
+            if (
+                not state.get("shortcut_enabled")
+                or get_async_key_state is None
+                or state.get("shortcut_capture")
+            ):
+                repeat_detector.reset()
+                combo_detector.reset()
                 return
-            ctrl_down = any(
-                bool(get_async_key_state(vk) & 0x8000) for vk in CTRL_VIRTUAL_KEYS
-            )
-            other_key_down = False
-            if ctrl_down:
-                other_key_down = _other_shortcut_key_down(get_async_key_state)
-            toggled = double_ctrl_detector.update(
-                ctrl_down,
-                other_key_down,
-                time.monotonic(),
-            )
+            toggled = False
+            mode = _normalize_shortcut_mode(state.get("shortcut_mode"))
+            if mode == SHORTCUT_MODE_COMBO:
+                combo_keys = list(state.get("shortcut_combo") or SHORTCUT_COMBO_DEFAULT)
+                if len(combo_keys) >= 2:
+                    all_down = all(
+                        _named_key_down(get_async_key_state, name) for name in combo_keys
+                    )
+                    extra = _other_shortcut_key_down(
+                        get_async_key_state, exclude_keys=combo_keys
+                    )
+                    toggled = combo_detector.update(all_down and not extra)
+            else:
+                combo_detector.reset()
+                key_name = _normalize_shortcut_key(state.get("shortcut_key"))
+                key_down = _named_key_down(get_async_key_state, key_name)
+                other_key_down = False
+                if key_down:
+                    other_key_down = _other_shortcut_key_down(
+                        get_async_key_state, exclude_keys=[key_name]
+                    )
+                repeat_detector.tap_count = _normalize_shortcut_repeat_count(
+                    state.get("shortcut_repeat_count")
+                )
+                toggled = repeat_detector.update(
+                    key_down,
+                    other_key_down,
+                    time.monotonic(),
+                )
             if toggled:
                 toggle_wallpaper_mode()
         finally:
@@ -6051,6 +6390,51 @@ def run_ui() -> None:
         ).pack(side="left")
         render_provider_tree()
 
+        tk.Label(
+            providers_pad,
+            text="额度重置时区",
+            fg=FG,
+            bg=BG,
+            font=settings_font,
+            anchor="w",
+        ).pack(fill="x", pady=(10, 2))
+        tk.Label(
+            providers_pad,
+            text="用于 LLM Proxy 的重置倒计时。默认 UTC+8，也可填写 UTC、UTC+9 或 IANA 名称。",
+            fg=FG_MUTED,
+            bg=BG,
+            font=settings_font_small,
+            anchor="w",
+            justify="left",
+            wraplength=380,
+        ).pack(fill="x", pady=(0, 4))
+        timezone_var = tk.StringVar(
+            value=_normalize_llm_proxy_timezone(
+                state.get("llm_proxy_timezone") or cfg.get("llm_proxy_timezone")
+            )
+        )
+
+        def persist_timezone(_event: Any = None) -> None:
+            normalized = _normalize_llm_proxy_timezone(timezone_var.get())
+            timezone_var.set(normalized)
+            if normalized == state.get("llm_proxy_timezone"):
+                return
+            state["llm_proxy_timezone"] = normalized
+            cfg["llm_proxy_timezone"] = normalized
+            save_config(cfg)
+            refresh_async(force=True)
+
+        timezone_combo = ttk.Combobox(
+            providers_pad,
+            textvariable=timezone_var,
+            values=("UTC+8", "UTC", "UTC+9", "UTC-5", "UTC-8"),
+            font=settings_font,
+        )
+        timezone_combo.pack(fill="x")
+        timezone_combo.bind("<<ComboboxSelected>>", persist_timezone)
+        timezone_combo.bind("<Return>", persist_timezone)
+        timezone_combo.bind("<FocusOut>", persist_timezone)
+
         settings_monitors = _enumerate_monitors()
         monitor_by_label = {_monitor_label(monitor): monitor for monitor in settings_monitors}
         selected_monitor = _choose_panel_monitor(
@@ -6190,16 +6574,69 @@ def run_ui() -> None:
         )
         panel_status.pack(fill="x", pady=(0, 10))
 
-        shortcut_var = tk.BooleanVar(value=bool(state["double_ctrl_toggle"]))
+        key_labels = (("Ctrl", "ctrl"), ("Shift", "shift"), ("Alt", "alt"), ("Win", "win"))
+        key_label_to_id = {label: key for label, key in key_labels}
+        key_id_to_label = {key: label for label, key in key_labels}
+        shortcut_enabled_var = tk.BooleanVar(value=bool(state.get("shortcut_enabled", True)))
+        shortcut_mode_var = tk.StringVar(
+            value=_normalize_shortcut_mode(state.get("shortcut_mode"))
+        )
+        shortcut_key_var = tk.StringVar(
+            value=key_id_to_label.get(
+                _normalize_shortcut_key(state.get("shortcut_key")), "Ctrl"
+            )
+        )
+        shortcut_count_var = tk.StringVar(
+            value=str(_normalize_shortcut_repeat_count(state.get("shortcut_repeat_count")))
+        )
+        shortcut_combo_keys = list(
+            state.get("shortcut_combo") or SHORTCUT_COMBO_DEFAULT
+        )
+        shortcut_combo_var = tk.StringVar(
+            value=_format_shortcut_combo(shortcut_combo_keys)
+        )
 
-        def on_shortcut_toggle() -> None:
-            set_double_ctrl_toggle(bool(shortcut_var.get()), persist=True)
+        def persist_shortcut_from_ui() -> None:
+            apply_shortcut_config(
+                enabled=bool(shortcut_enabled_var.get()),
+                mode=shortcut_mode_var.get(),
+                key=key_label_to_id.get(shortcut_key_var.get(), "ctrl"),
+                repeat_count=_normalize_shortcut_repeat_count(shortcut_count_var.get()),
+                combo=shortcut_combo_keys,
+                persist=True,
+            )
+            shortcut_count_var.set(str(state["shortcut_repeat_count"]))
+            shortcut_combo_var.set(_format_shortcut_combo(state["shortcut_combo"]))
+            update_shortcut_controls()
 
-        shortcut_checkbox = tk.Checkbutton(
+        def update_shortcut_controls() -> None:
+            enabled = bool(shortcut_enabled_var.get())
+            mode = _normalize_shortcut_mode(shortcut_mode_var.get())
+            repeat_state = "normal" if enabled and mode == SHORTCUT_MODE_REPEAT else "disabled"
+            combo_state = "normal" if enabled and mode == SHORTCUT_MODE_COMBO else "disabled"
+            try:
+                for widget in shortcut_repeat_widgets:
+                    widget.configure(state=repeat_state)
+                for widget in shortcut_combo_widgets:
+                    widget.configure(state=combo_state)
+                for widget in shortcut_mode_widgets:
+                    widget.configure(state="normal" if enabled else "disabled")
+            except Exception:
+                pass
+
+        tk.Label(
             display_pad,
-            text="连续按两次 Ctrl 切换用量 / 动态壁纸",
-            variable=shortcut_var,
-            command=on_shortcut_toggle,
+            text="快捷键",
+            fg=FG,
+            bg=BG,
+            font=settings_font,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 2))
+        tk.Checkbutton(
+            display_pad,
+            text="启用快捷键，切换用量 / 动态壁纸",
+            variable=shortcut_enabled_var,
+            command=persist_shortcut_from_ui,
             bg=BG,
             fg=FG,
             activebackground=BG,
@@ -6207,18 +6644,164 @@ def run_ui() -> None:
             selectcolor=BG,
             font=settings_font,
             anchor="w",
+        ).pack(fill="x")
+
+        shortcut_mode_widgets: list[Any] = []
+        shortcut_repeat_widgets: list[Any] = []
+        shortcut_combo_widgets: list[Any] = []
+
+        mode_row = tk.Frame(display_pad, bg=BG)
+        mode_row.pack(fill="x", pady=(4, 2))
+        repeat_radio = tk.Radiobutton(
+            mode_row,
+            text="连按",
+            value=SHORTCUT_MODE_REPEAT,
+            variable=shortcut_mode_var,
+            command=persist_shortcut_from_ui,
+            bg=BG,
+            fg=FG,
+            activebackground=BG,
+            activeforeground=FG,
+            selectcolor=BG,
+            font=settings_font_small,
+            anchor="w",
         )
-        shortcut_checkbox.pack(fill="x", pady=(0, 2))
+        repeat_radio.pack(side="left")
+        combo_radio = tk.Radiobutton(
+            mode_row,
+            text="组合键",
+            value=SHORTCUT_MODE_COMBO,
+            variable=shortcut_mode_var,
+            command=persist_shortcut_from_ui,
+            bg=BG,
+            fg=FG,
+            activebackground=BG,
+            activeforeground=FG,
+            selectcolor=BG,
+            font=settings_font_small,
+            anchor="w",
+        )
+        combo_radio.pack(side="left", padx=(12, 0))
+        shortcut_mode_widgets.extend((repeat_radio, combo_radio))
+
+        repeat_row = tk.Frame(display_pad, bg=BG)
+        repeat_row.pack(fill="x", pady=(0, 4))
+        tk.Label(
+            repeat_row,
+            text="按键",
+            fg=FG,
+            bg=BG,
+            font=settings_font_small,
+        ).pack(side="left")
+        key_menu = tk.OptionMenu(
+            repeat_row,
+            shortcut_key_var,
+            *[label for label, _key in key_labels],
+            command=lambda _value: persist_shortcut_from_ui(),
+        )
+        key_menu.configure(
+            bg="#f3f4f5",
+            fg=FG,
+            activebackground="#e8eaec",
+            font=settings_font_small,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        key_menu.pack(side="left", padx=(6, 12))
+        tk.Label(
+            repeat_row,
+            text="次数",
+            fg=FG,
+            bg=BG,
+            font=settings_font_small,
+        ).pack(side="left")
+        count_spin = tk.Spinbox(
+            repeat_row,
+            from_=SHORTCUT_REPEAT_COUNT_MIN,
+            to=SHORTCUT_REPEAT_COUNT_MAX,
+            width=3,
+            textvariable=shortcut_count_var,
+            command=persist_shortcut_from_ui,
+            font=settings_font_small,
+            justify="right",
+        )
+        count_spin.pack(side="left", padx=(6, 0))
+        count_spin.bind("<FocusOut>", lambda _event: persist_shortcut_from_ui())
+        count_spin.bind("<Return>", lambda _event: persist_shortcut_from_ui())
+        shortcut_repeat_widgets.extend((key_menu, count_spin))
+
+        combo_row = tk.Frame(display_pad, bg=BG)
+        combo_row.pack(fill="x", pady=(0, 2))
+        combo_label = tk.Label(
+            combo_row,
+            textvariable=shortcut_combo_var,
+            fg=FG,
+            bg="#f3f4f5",
+            font=settings_font_small,
+            anchor="w",
+            padx=8,
+            pady=3,
+        )
+        combo_label.pack(side="left", fill="x", expand=True)
+
+        def start_combo_capture() -> None:
+            if get_async_key_state is None:
+                shortcut_combo_var.set("当前系统无法录制快捷键")
+                return
+            state["shortcut_capture"] = True
+            shortcut_combo_var.set("请按下组合键…")
+            seen: list[str] = []
+
+            def finish(keys: list[str]) -> None:
+                state["shortcut_capture"] = False
+                if len(keys) >= 2:
+                    shortcut_combo_keys[:] = _normalize_shortcut_combo(keys)
+                    persist_shortcut_from_ui()
+                else:
+                    shortcut_combo_var.set(_format_shortcut_combo(shortcut_combo_keys))
+
+            def poll_capture(remaining: int) -> None:
+                if not state.get("shortcut_capture"):
+                    return
+                down = _shortcut_keys_currently_down(get_async_key_state)
+                if down:
+                    seen[:] = down
+                elif seen:
+                    finish(list(seen))
+                    return
+                if remaining <= 0:
+                    finish(list(seen))
+                    return
+                win.after(40, lambda: poll_capture(remaining - 1))
+
+            win.after(200, lambda: poll_capture(150))
+
+        capture_btn = tk.Button(
+            combo_row,
+            text="设置",
+            command=start_combo_capture,
+            bg="#f0f0f0",
+            fg=FG,
+            relief="flat",
+            padx=8,
+            pady=2,
+            font=settings_font_small,
+        )
+        capture_btn.pack(side="left", padx=(6, 0))
+        shortcut_combo_widgets.extend((combo_label, capture_btn))
+
         tk.Label(
             display_pad,
-            text="全局有效；Ctrl+C、Ctrl+V 等组合键不会触发。仅专用副屏模式生效。",
+            text="连按默认两次 Ctrl；组合键按下后立即切换。仅专用副屏模式生效。Ctrl+C 等不会触发连按。",
             fg=FG_MUTED,
             bg=BG,
             font=settings_font_small,
             anchor="w",
-            wraplength=300,
+            wraplength=380,
             justify="left",
         ).pack(fill="x", pady=(0, 8))
+        update_shortcut_controls()
 
         wallpaper_folders = list(state.get("wallpaper_folders") or [])
         wallpaper_disabled_folders = list(
@@ -7015,7 +7598,17 @@ def run_ui() -> None:
             cfg["display_mode"] = str(state["display_mode"])
             cfg["monitor_device"] = state.get("monitor_device")
             cfg["monitor_id"] = state.get("monitor_id")
-            cfg["double_ctrl_toggle"] = bool(state["double_ctrl_toggle"])
+            cfg["double_ctrl_toggle"] = bool(state.get("shortcut_enabled", True))
+            cfg["shortcut_enabled"] = bool(state.get("shortcut_enabled", True))
+            cfg["shortcut_mode"] = _normalize_shortcut_mode(state.get("shortcut_mode"))
+            cfg["shortcut_key"] = _normalize_shortcut_key(state.get("shortcut_key"))
+            cfg["shortcut_repeat_count"] = _normalize_shortcut_repeat_count(
+                state.get("shortcut_repeat_count")
+            )
+            cfg["shortcut_combo"] = _normalize_shortcut_combo(state.get("shortcut_combo"))
+            cfg["llm_proxy_timezone"] = _normalize_llm_proxy_timezone(
+                state.get("llm_proxy_timezone")
+            )
             cfg["wallpaper_folder"] = state.get("wallpaper_folder")
             cfg["wallpaper_folders"] = list(state.get("wallpaper_folders") or [])
             cfg["wallpaper_disabled_folders"] = list(
@@ -7029,6 +7622,8 @@ def run_ui() -> None:
             )
             cfg["wallpaper_image_seconds"] = int(state["wallpaper_image_seconds"])
             cfg["wallpaper_audio"] = bool(state.get("wallpaper_audio", True))
+            persist_timezone()
+            persist_shortcut_from_ui()
             persist_providers(refresh=False)
             if not state.get("panel_active"):
                 cfg["x"] = root.winfo_x()
@@ -7430,7 +8025,17 @@ def run_ui() -> None:
         cfg["display_mode"] = str(state["display_mode"])
         cfg["monitor_device"] = state.get("monitor_device")
         cfg["monitor_id"] = state.get("monitor_id")
-        cfg["double_ctrl_toggle"] = bool(state["double_ctrl_toggle"])
+        cfg["double_ctrl_toggle"] = bool(state.get("shortcut_enabled", True))
+        cfg["shortcut_enabled"] = bool(state.get("shortcut_enabled", True))
+        cfg["shortcut_mode"] = _normalize_shortcut_mode(state.get("shortcut_mode"))
+        cfg["shortcut_key"] = _normalize_shortcut_key(state.get("shortcut_key"))
+        cfg["shortcut_repeat_count"] = _normalize_shortcut_repeat_count(
+            state.get("shortcut_repeat_count")
+        )
+        cfg["shortcut_combo"] = _normalize_shortcut_combo(state.get("shortcut_combo"))
+        cfg["llm_proxy_timezone"] = _normalize_llm_proxy_timezone(
+            state.get("llm_proxy_timezone")
+        )
         cfg["wallpaper_folder"] = state.get("wallpaper_folder")
         cfg["wallpaper_folders"] = list(state.get("wallpaper_folders") or [])
         cfg["wallpaper_disabled_folders"] = list(
@@ -7603,7 +8208,17 @@ def run_ui() -> None:
     cfg["display_mode"] = str(state["display_mode"])
     cfg["monitor_device"] = state.get("monitor_device")
     cfg["monitor_id"] = state.get("monitor_id")
-    cfg["double_ctrl_toggle"] = bool(state["double_ctrl_toggle"])
+    cfg["double_ctrl_toggle"] = bool(state.get("shortcut_enabled", True))
+    cfg["shortcut_enabled"] = bool(state.get("shortcut_enabled", True))
+    cfg["shortcut_mode"] = _normalize_shortcut_mode(state.get("shortcut_mode"))
+    cfg["shortcut_key"] = _normalize_shortcut_key(state.get("shortcut_key"))
+    cfg["shortcut_repeat_count"] = _normalize_shortcut_repeat_count(
+        state.get("shortcut_repeat_count")
+    )
+    cfg["shortcut_combo"] = _normalize_shortcut_combo(state.get("shortcut_combo"))
+    cfg["llm_proxy_timezone"] = _normalize_llm_proxy_timezone(
+        state.get("llm_proxy_timezone")
+    )
     cfg["wallpaper_folder"] = state.get("wallpaper_folder")
     cfg["wallpaper_folders"] = list(state.get("wallpaper_folders") or [])
     cfg["wallpaper_disabled_folders"] = list(
@@ -7663,6 +8278,7 @@ def run_ui() -> None:
 
                 state["display_mode"] = DISPLAY_MODE_PANEL
                 state["double_ctrl_toggle"] = True
+                state["shortcut_enabled"] = True
                 state["panel_active"] = True
                 open_settings()
                 win = state.get("settings_win")

@@ -11,6 +11,7 @@ import usage_float as usage_float_module
 from usage_float import (
     BG_OPACITY_DEFAULT,
     DEFAULT_PROVIDERS,
+    LLM_PROXY_TIMEZONE_DEFAULT,
     MonitorInfo,
     TEXT_OPACITY_DEFAULT,
     WALLPAPER_RANDOM_MODE_DIRECTORY,
@@ -429,6 +430,19 @@ class DoubleCtrlDetectorTests(unittest.TestCase):
 
         self.assertFalse(_other_shortcut_key_down(ime_only))
         self.assertTrue(_other_shortcut_key_down(real_ctrl_c))
+
+    def test_three_clean_taps_toggle_when_count_is_three(self) -> None:
+        detector = _DoubleCtrlDetector(interval_seconds=0.45, tap_count=3)
+        self.assertFalse(self.tap(detector, 1.0))
+        self.assertFalse(self.tap(detector, 1.2))
+        self.assertTrue(self.tap(detector, 1.4))
+
+    def test_combo_fires_once_on_press_and_not_while_held(self) -> None:
+        detector = usage_float_module._ComboKeyDetector()
+        self.assertTrue(detector.update(True))
+        self.assertFalse(detector.update(True))
+        self.assertFalse(detector.update(False))
+        self.assertTrue(detector.update(True))
 
 
 class RemainingTimeTests(unittest.TestCase):
@@ -994,7 +1008,23 @@ class LlmProxyUsageTests(unittest.TestCase):
         ):
             duration, timezone_name = usage_float_module._llm_proxy_budget_settings()
         self.assertEqual(duration, "7d")
-        self.assertEqual(timezone_name, "UTC")
+        self.assertEqual(timezone_name, "UTC+8")
+        self.assertEqual(LLM_PROXY_TIMEZONE_DEFAULT, "UTC+8")
+
+    def test_utc_plus_eight_weekly_reset_is_monday_local_midnight(self) -> None:
+        now = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+        reset = usage_float_module.next_llm_proxy_budget_reset(
+            "7d", now=now, timezone_name="UTC+8"
+        )
+        self.assertIsNotNone(reset)
+        assert reset is not None
+        self.assertEqual(reset.utcoffset(), timedelta(hours=8))
+        self.assertEqual(reset.weekday(), 0)
+        self.assertEqual(reset.hour, 0)
+        self.assertEqual(
+            reset.astimezone(timezone.utc),
+            datetime(2026, 9, 20, 16, 0, tzinfo=timezone.utc),
+        )
 
     def test_monthly_budget_resets_on_the_first(self) -> None:
         now = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
@@ -1034,6 +1064,28 @@ class LlmProxyUsageTests(unittest.TestCase):
         self.assertIsNotNone(iso)
         parsed = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
         self.assertEqual(parsed.date(), datetime(2026, 10, 1).date())
+
+
+    def test_shortcut_config_migrates_legacy_double_ctrl_flag(self) -> None:
+        disabled = usage_float_module._normalize_shortcut_config(
+            {"double_ctrl_toggle": False}
+        )
+        self.assertFalse(disabled["shortcut_enabled"])
+        enabled = usage_float_module._normalize_shortcut_config({})
+        self.assertTrue(enabled["shortcut_enabled"])
+        self.assertEqual(enabled["shortcut_mode"], "repeat")
+        self.assertEqual(enabled["shortcut_key"], "ctrl")
+        self.assertEqual(enabled["shortcut_repeat_count"], 2)
+
+    def test_shortcut_combo_normalizes_and_keeps_modifiers_first(self) -> None:
+        self.assertEqual(
+            usage_float_module._normalize_shortcut_combo("w+ctrl+shift"),
+            ["ctrl", "shift", "w"],
+        )
+        self.assertEqual(
+            usage_float_module._normalize_shortcut_combo(["ctrl"]),
+            ["ctrl", "alt"],
+        )
 
 
 class ProviderConfigTests(unittest.TestCase):
