@@ -10,6 +10,7 @@ import usage_float as usage_float_module
 
 from usage_float import (
     BG_OPACITY_DEFAULT,
+    DEFAULT_PROVIDERS,
     MonitorInfo,
     TEXT_OPACITY_DEFAULT,
     WALLPAPER_RANDOM_MODE_DIRECTORY,
@@ -842,6 +843,11 @@ class CodexMultiAccountTests(unittest.TestCase):
             config["providers"],
             ["claude", "codex", "codex-2", "grok", "llmproxy"],
         )
+        self.assertEqual(
+            config["provider_order"],
+            ["claude", "codex", "codex-2", "grok", "llmproxy"],
+        )
+        self.assertEqual(config["disabled_providers"], [])
 
     def test_redeeming_targets_the_clicked_account_home(self) -> None:
         seen: dict[str, object] = {}
@@ -971,6 +977,101 @@ class LlmProxyUsageTests(unittest.TestCase):
         rows = iter_display_rows([usage])
         self.assertEqual(rows[0].title, "llmproxy")
         self.assertEqual(rows[0].summary, "$20/200")
+
+
+class ProviderConfigTests(unittest.TestCase):
+    def test_new_defaults_are_enabled_unless_already_disabled(self) -> None:
+        order, enabled, disabled = usage_float_module.resolve_provider_config(
+            ["claude", "codex", "grok"],
+            [],
+            ["claude", "codex", "grok"],
+        )
+        self.assertEqual(order, ["claude", "codex", "codex-2", "grok", "llmproxy"])
+        self.assertEqual(enabled, ["claude", "codex", "codex-2", "grok", "llmproxy"])
+        self.assertEqual(disabled, [])
+
+    def test_disabled_providers_keep_order_and_stay_hidden(self) -> None:
+        order, enabled, disabled = usage_float_module.resolve_provider_config(
+            ["grok", "codex"],
+            ["claude"],
+            ["grok", "codex", "claude"],
+        )
+        self.assertEqual(order, ["grok", "codex", "codex-2", "claude", "llmproxy"])
+        self.assertEqual(enabled, ["grok", "codex", "codex-2", "llmproxy"])
+        self.assertEqual(disabled, ["claude"])
+
+    def test_unchecking_every_row_stays_empty(self) -> None:
+        order, enabled, disabled = usage_float_module.resolve_provider_config(
+            [],
+            list(DEFAULT_PROVIDERS),
+            list(DEFAULT_PROVIDERS),
+        )
+        self.assertEqual(order, list(DEFAULT_PROVIDERS))
+        self.assertEqual(enabled, [])
+        self.assertEqual(disabled, list(DEFAULT_PROVIDERS))
+
+    def test_move_provider_places_source_on_target_index(self) -> None:
+        self.assertEqual(
+            usage_float_module.move_provider(
+                ["codex", "grok", "claude"], "codex", "claude"
+            ),
+            ["grok", "claude", "codex"],
+        )
+        self.assertEqual(
+            usage_float_module.move_provider(
+                ["codex", "grok", "claude"], "claude", "codex"
+            ),
+            ["claude", "codex", "grok"],
+        )
+
+    def test_load_config_preserves_explicit_disabled_list(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "providers": ["grok", "codex"],
+                        "provider_order": ["grok", "codex", "claude"],
+                        "disabled_providers": ["claude"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(usage_float_module, "CONFIG_PATH", config_path):
+                config = usage_float_module.load_config()
+
+        self.assertEqual(
+            config["provider_order"],
+            ["grok", "codex", "codex-2", "claude", "llmproxy"],
+        )
+        self.assertEqual(config["providers"], ["grok", "codex", "codex-2", "llmproxy"])
+        self.assertEqual(config["disabled_providers"], ["claude"])
+
+    def test_scan_providers_reports_login_state_in_saved_order(self) -> None:
+        availability = {
+            "codex": True,
+            "codex-2": False,
+            "grok": True,
+            "claude": False,
+            "llmproxy": True,
+        }
+        with patch.object(
+            usage_float_module,
+            "provider_available",
+            side_effect=lambda pid: availability.get(pid, False),
+        ):
+            rows = usage_float_module.scan_providers(
+                ["grok", "codex"],
+                ["grok", "codex", "claude"],
+            )
+
+        self.assertEqual(
+            [row["id"] for row in rows],
+            ["grok", "codex", "codex-2", "claude", "llmproxy"],
+        )
+        self.assertEqual(rows[0]["label"], "Grok")
+        self.assertTrue(rows[0]["available"])
+        self.assertFalse(rows[3]["available"])
 
 
 if __name__ == "__main__":

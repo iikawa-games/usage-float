@@ -2,7 +2,7 @@
 
 Windows 用量 HUD：把 Claude / Codex / Grok 订阅用量（以及可选的 LiteLLM 代理额度）铺在专用副屏上，双击 Ctrl 切到文件夹动态壁纸。
 
-无标题栏、不占任务栏。没有登录凭证的 provider 不会出现占位行。
+无标题栏、不占任务栏。没有登录凭证的 provider 不会出现占位行。设置 → **用量** 可扫描本机登录态、勾选要显示的行，并拖动调整顺序。
 
 ## 截图
 
@@ -21,8 +21,8 @@ Windows 用量 HUD：把 Claude / Codex / Grok 订阅用量（以及可选的 Li
 ## 需要什么
 
 - Windows
-- Python 3.10+（带 tkinter）
-- 可选：`.\install-mpv.ps1` 下载副屏动态壁纸用的 mpv
+- 发行包：从 [Releases](https://github.com/iikawa0918/usage-float/releases) 下载 `usage-float-*-windows-x64.zip`，解压后双击 `UsageFloat.exe`（已内置 mpv）
+- 源码运行：Python 3.10+（带 tkinter）；动态壁纸可再执行 `.\install-mpv.ps1`
 
 凭证都在本机，不经过第三方服务器：
 
@@ -41,6 +41,8 @@ $env:CODEX_HOME="$env:USERPROFILE\.codex-2"; codex login
 ```
 
 ## 启动
+
+发行包解压后直接运行 `UsageFloat.exe`。源码：
 
 ```powershell
 python usage_float.py once          # 命令行看一眼
@@ -64,7 +66,7 @@ python usage_float.py autostart on  # 开机自启
 
 ## 专用副屏
 
-右键 → **设置…** → 选中目标显示器 → 打开「专用副屏模式」。程序用显示器硬件标识锁定副屏，重新插拔后会再铺满该屏；显示器被拔掉时临时退回悬浮窗。
+右键 → **设置…** → **用量** 扫描 provider、勾选显示项并拖动排序。**副屏** 里选中目标显示器后打开「专用副屏模式」。程序用显示器硬件标识锁定副屏，重新插拔后会再铺满该屏；显示器被拔掉时临时退回悬浮窗。
 
 ## 动态壁纸
 
@@ -106,6 +108,8 @@ python usage_float.py autostart on  # 开机自启
 {
   "always_on_top": true,
   "providers": ["codex", "codex-2", "grok", "claude", "llmproxy"],
+  "provider_order": ["codex", "codex-2", "grok", "claude", "llmproxy"],
+  "disabled_providers": [],
   "refresh_seconds": 300,
   "display_mode": "panel",
   "double_ctrl_toggle": true,
@@ -121,6 +125,7 @@ python usage_float.py autostart on  # 开机自启
 
 ```powershell
 python -m unittest test_usage_float.py
+.\build-release.ps1    # 生成 dist\usage-float-<version>-windows-x64.zip
 ```
 
 ## 许可

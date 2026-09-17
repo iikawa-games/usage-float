@@ -21,3 +21,7 @@ vendor/mpv/*.exe
 vendor/mpv/*.dll
 vendor/mpv/LICENSE.GPL
 vendor/mpv/Copyright
+
+# PyInstaller
+build/
+dist/

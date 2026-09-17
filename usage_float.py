@@ -37,7 +37,12 @@ from typing import Any, Callable
 # ---------------------------------------------------------------------------
 
 HOME = Path.home()
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+VERSION = "1.1.0"
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", HOME / ".claude"))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 CODEX_HOME_2 = Path(os.environ.get("CODEX_HOME_2", HOME / ".codex-2"))
@@ -51,7 +56,10 @@ LIWORK_ORCA_PATH = (
 )
 CONFIG_PATH = HOME / ".usage-float" / "config.json"
 CACHE_PATH = HOME / ".usage-float" / "usage-cache.json"
-WALLPAPER_START_SCRIPT_PATH = APP_DIR / "wallpaper-start.lua"
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", str(APP_DIR)))
+WALLPAPER_START_SCRIPT_PATH = RESOURCE_DIR / "wallpaper-start.lua"
+if not WALLPAPER_START_SCRIPT_PATH.exists():
+    WALLPAPER_START_SCRIPT_PATH = APP_DIR / "wallpaper-start.lua"
 _INSTANCE_MUTEX_HANDLE: Any = None
 
 CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -112,6 +120,13 @@ DEFAULT_PROVIDERS: tuple[str, ...] = (
     "claude",
     "llmproxy",
 )
+PROVIDER_LABELS: dict[str, str] = {
+    "codex": "Codex",
+    "codex-2": "Codex 2",
+    "grok": "Grok",
+    "claude": "Claude",
+    "llmproxy": "LLM Proxy",
+}
 
 # SuperGrok / Grok Build credit window (same endpoint CC Switch / CodexBar use).
 # NOT cli-chat-proxy.grok.com/v1/billing — that returns 0/0 for subscription accounts.
@@ -1413,12 +1428,90 @@ def _acquire_single_instance() -> bool:
         return True
 
 
+def provider_label(provider_id: str) -> str:
+    return PROVIDER_LABELS.get(provider_id, provider_id)
+
+
+def _unique_provider_ids(values: Any) -> list[str]:
+    out: list[str] = []
+    for item in values or []:
+        if isinstance(item, str):
+            pid = item.strip()
+            if pid and pid not in out:
+                out.append(pid)
+    return out
+
+
+def resolve_provider_config(
+    providers: Any,
+    disabled: Any = None,
+    order: Any = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Return (order, enabled, disabled) for HUD + settings.
+
+    Newly added DEFAULT_PROVIDERS are inserted into order and stay enabled
+    unless they already appear in ``disabled``.
+    """
+    enabled_in = _unique_provider_ids(providers)
+    disabled_list = _unique_provider_ids(disabled)
+    disabled_in = set(disabled_list)
+    known = _unique_provider_ids(list(order or []) + enabled_in + disabled_list)
+    if not known:
+        known = list(DEFAULT_PROVIDERS)
+    for index, must in enumerate(DEFAULT_PROVIDERS):
+        if must not in known:
+            previous = DEFAULT_PROVIDERS[index - 1] if index else None
+            if previous and must.startswith(previous + "-") and previous in known:
+                known.insert(known.index(previous) + 1, must)
+            else:
+                known.append(must)
+        if must not in disabled_in and must not in enabled_in:
+            enabled_in.append(must)
+    enabled_set = set(enabled_in) - disabled_in
+    enabled = [pid for pid in known if pid in enabled_set]
+    disabled_out = [pid for pid in known if pid not in enabled_set]
+    return known, enabled, disabled_out
+
+
+def move_provider(order: list[str], source: str, target: str) -> list[str]:
+    """Place ``source`` at the current index of ``target``."""
+    items = _unique_provider_ids(order)
+    if source not in items or target not in items or source == target:
+        return items
+    destination = items.index(target)
+    items.pop(items.index(source))
+    items.insert(destination, source)
+    return items
+
+
+def scan_providers(
+    configured: list[str] | None = None,
+    order: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Scan known provider slots and report which ones have credentials."""
+    known, _enabled, _disabled = resolve_provider_config(
+        configured if configured is not None else list(DEFAULT_PROVIDERS),
+        [],
+        order,
+    )
+    return [
+        {
+            "id": pid,
+            "label": provider_label(pid),
+            "available": provider_available(pid),
+        }
+        for pid in known
+    ]
+
+
 def load_config() -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "always_on_top": True,
         "x": None,
         "y": None,
         "providers": list(DEFAULT_PROVIDERS),
+        "provider_order": list(DEFAULT_PROVIDERS),
+        "disabled_providers": [],
         "refresh_seconds": REFRESH_SECONDS,
         "alpha": WINDOW_ALPHA,  # legacy; migrated to bg_opacity
         "bg_opacity": BG_OPACITY_DEFAULT,
@@ -1440,10 +1533,12 @@ def load_config() -> dict[str, Any]:
         "wallpaper_audio": True,
         "mpv_path": None,
     }
+    file_data: dict[str, Any] = {}
     try:
         if CONFIG_PATH.exists():
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
+                file_data = data
                 defaults.update(data)
     except Exception:
         pass
@@ -1521,19 +1616,23 @@ def load_config() -> dict[str, Any]:
     defaults["text_opacity"] = _clamp_opacity(
         defaults.get("text_opacity"), TEXT_OPACITY_DEFAULT
     )
-    # Keep whatever order the user saved. A newly supported provider is
-    # appended, except hyphen-suffix siblings (codex-2 under codex) which
-    # still slot next to the account they belong to.
-    providers = [p for p in (defaults.get("providers") or []) if isinstance(p, str)]
-    for index, must in enumerate(DEFAULT_PROVIDERS):
-        if must in providers:
-            continue
-        previous = DEFAULT_PROVIDERS[index - 1] if index else None
-        if previous and must.startswith(previous + "-") and previous in providers:
-            providers.insert(providers.index(previous) + 1, must)
-        else:
-            providers.append(must)
-    defaults["providers"] = providers
+    if "provider_order" in file_data:
+        order_arg: Any = file_data.get("provider_order")
+    elif "providers" in file_data or "disabled_providers" in file_data:
+        order_arg = _unique_provider_ids(
+            list(file_data.get("providers") or [])
+            + list(file_data.get("disabled_providers") or [])
+        )
+    else:
+        order_arg = defaults.get("provider_order")
+    order, enabled, disabled = resolve_provider_config(
+        defaults.get("providers"),
+        defaults.get("disabled_providers"),
+        order_arg,
+    )
+    defaults["provider_order"] = order
+    defaults["providers"] = enabled
+    defaults["disabled_providers"] = disabled
     shot_root = os.environ.get("USAGE_FLOAT_DOCS_SHOT_ROOT")
     if shot_root:
         root = Path(shot_root)
@@ -3053,6 +3152,8 @@ AUTOSTART_VALUE = "UsageFloat"
 
 
 def _script_command() -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}"'
     script = Path(__file__).resolve()
     pyw = Path(sys.executable).with_name("pythonw.exe")
     exe = str(pyw if pyw.exists() else Path(sys.executable))
@@ -5523,12 +5624,16 @@ def run_ui() -> None:
             pass
         notebook = ttk.Notebook(shell, style="UsageFloat.TNotebook", width=430, height=445)
         notebook.pack(fill="both", expand=True)
+        providers_tab = tk.Frame(notebook, bg=BG)
         display_tab = tk.Frame(notebook, bg=BG)
         wallpaper_tab = tk.Frame(notebook, bg=BG)
         floating_tab = tk.Frame(notebook, bg=BG)
+        notebook.add(providers_tab, text="用量")
         notebook.add(display_tab, text="副屏")
         notebook.add(wallpaper_tab, text="动态壁纸")
         notebook.add(floating_tab, text="悬浮窗")
+        providers_pad = tk.Frame(providers_tab, bg=BG, padx=14, pady=12)
+        providers_pad.pack(fill="both", expand=True)
         display_pad = tk.Frame(display_tab, bg=BG, padx=14, pady=12)
         display_pad.pack(fill="both", expand=True)
         floating_pad = tk.Frame(floating_tab, bg=BG, padx=14, pady=12)
@@ -5556,6 +5661,207 @@ def run_ui() -> None:
         # Tk widgets only keep the Tcl font name. Retain the Python objects so
         # their destructors do not delete those named fonts while the window is open.
         setattr(win, "_usage_float_fonts", (settings_font, settings_font_small))
+
+        provider_order = list(cfg.get("provider_order") or DEFAULT_PROVIDERS)
+        enabled_providers = list(cfg.get("providers") or DEFAULT_PROVIDERS)
+        provider_drag = {"item": None, "moved": False}
+
+        tk.Label(
+            providers_pad,
+            text="显示的用量",
+            fg=FG,
+            bg=BG,
+            font=settings_font,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 2))
+        tk.Label(
+            providers_pad,
+            text="扫描本机登录态。勾选要显示的用量，按住行拖动可调整顺序。未登录的不会出现在面板上。",
+            fg=FG_MUTED,
+            bg=BG,
+            font=settings_font_small,
+            anchor="w",
+            justify="left",
+            wraplength=380,
+        ).pack(fill="x", pady=(0, 6))
+
+        provider_list_frame = tk.Frame(providers_pad, bg=BG)
+        provider_list_frame.pack(fill="both", expand=True)
+        provider_tree = ttk.Treeview(
+            provider_list_frame,
+            columns=("enabled", "name", "status"),
+            show="headings",
+            height=9,
+            selectmode="browse",
+        )
+        provider_tree.heading("enabled", text="显示")
+        provider_tree.heading("name", text="Provider", anchor="w")
+        provider_tree.heading("status", text="状态")
+        provider_tree.column("enabled", width=48, minwidth=48, stretch=False, anchor="center")
+        provider_tree.column("name", width=210, minwidth=120, stretch=True, anchor="w")
+        provider_tree.column("status", width=90, minwidth=72, stretch=False, anchor="center")
+        provider_tree.tag_configure("disabled", foreground=FG_MUTED)
+        provider_tree.pack(side="left", fill="both", expand=True)
+        provider_scrollbar = tk.Scrollbar(provider_list_frame, command=provider_tree.yview)
+        provider_scrollbar.pack(side="right", fill="y")
+        provider_tree.configure(yscrollcommand=provider_scrollbar.set)
+
+        provider_button_row = tk.Frame(providers_pad, bg=BG)
+        provider_button_row.pack(fill="x", pady=(6, 4))
+        provider_status = tk.Label(
+            providers_pad,
+            text="",
+            fg=FG_MUTED,
+            bg=BG,
+            font=settings_font_small,
+            anchor="w",
+            justify="left",
+            wraplength=380,
+        )
+        provider_status.pack(fill="x")
+
+        def persist_providers(*, refresh: bool = True) -> None:
+            order, enabled, disabled = resolve_provider_config(
+                enabled_providers,
+                [pid for pid in provider_order if pid not in set(enabled_providers)],
+                provider_order,
+            )
+            provider_order[:] = order
+            enabled_providers[:] = enabled
+            cfg["provider_order"] = list(order)
+            cfg["providers"] = list(enabled)
+            cfg["disabled_providers"] = list(disabled)
+            save_config(cfg)
+            if refresh:
+                refresh_async(force=True)
+
+        def render_provider_tree(
+            scanned: list[dict[str, Any]] | None = None,
+            *,
+            note: str = "",
+        ) -> None:
+            if scanned is None:
+                scanned = scan_providers(enabled_providers, provider_order)
+            by_id = {row["id"]: row for row in scanned}
+            provider_tree.delete(*provider_tree.get_children())
+            enabled_set = set(enabled_providers)
+            for pid in provider_order:
+                row = by_id.get(pid) or {
+                    "id": pid,
+                    "label": provider_label(pid),
+                    "available": provider_available(pid),
+                }
+                checked = pid in enabled_set
+                provider_tree.insert(
+                    "",
+                    "end",
+                    iid=pid,
+                    values=(
+                        "☑" if checked else "☐",
+                        row.get("label") or provider_label(pid),
+                        "已登录" if row.get("available") else "未检测到",
+                    ),
+                    tags=(() if checked else ("disabled",)),
+                )
+            available_count = sum(1 for row in scanned if row.get("available"))
+            text = (
+                f"已登录 {available_count} / 共 {len(provider_order)}"
+                f" · 显示 {len(enabled_providers)}"
+            )
+            if note:
+                text = f"{text} · {note}"
+            provider_status.configure(text=text)
+
+        def toggle_provider(pid: str) -> None:
+            if not pid:
+                return
+            enabled_set = set(enabled_providers)
+            if pid in enabled_set:
+                enabled_set.remove(pid)
+            else:
+                enabled_set.add(pid)
+            enabled_providers[:] = [item for item in provider_order if item in enabled_set]
+            persist_providers()
+            render_provider_tree()
+
+        def on_provider_press(event: Any) -> str | None:
+            if provider_tree.identify_region(event.x, event.y) != "cell":
+                provider_drag["item"] = None
+                return None
+            item = provider_tree.identify_row(event.y)
+            if not item:
+                provider_drag["item"] = None
+                return None
+            if provider_tree.identify_column(event.x) == "#1":
+                provider_drag["item"] = None
+                toggle_provider(item)
+                return "break"
+            provider_drag["item"] = item
+            provider_drag["moved"] = False
+            provider_tree.selection_set(item)
+            return None
+
+        def on_provider_motion(event: Any) -> str | None:
+            item = provider_drag["item"]
+            if not item:
+                return None
+            target = provider_tree.identify_row(event.y)
+            if target and target != item:
+                provider_tree.move(item, "", provider_tree.index(target))
+                provider_drag["moved"] = True
+            return "break"
+
+        def on_provider_release(_event: Any) -> None:
+            if provider_drag["moved"]:
+                provider_order[:] = list(provider_tree.get_children())
+                enabled_set = set(enabled_providers)
+                enabled_providers[:] = [
+                    pid for pid in provider_order if pid in enabled_set
+                ]
+                persist_providers()
+                render_provider_tree()
+            provider_drag["item"] = None
+            provider_drag["moved"] = False
+
+        def on_provider_space(_event: Any) -> str:
+            selection = provider_tree.selection()
+            if selection:
+                toggle_provider(selection[0])
+            return "break"
+
+        def on_scan_providers() -> None:
+            scanned = scan_providers(enabled_providers, provider_order)
+            changed = False
+            for row in scanned:
+                pid = str(row.get("id") or "")
+                if not pid or pid in provider_order:
+                    continue
+                provider_order.append(pid)
+                if pid not in enabled_providers:
+                    enabled_providers.append(pid)
+                changed = True
+            if changed:
+                persist_providers(refresh=True)
+            else:
+                refresh_async(force=True)
+            render_provider_tree(scanned, note="已扫描")
+
+        provider_tree.bind("<ButtonPress-1>", on_provider_press)
+        provider_tree.bind("<B1-Motion>", on_provider_motion)
+        provider_tree.bind("<ButtonRelease-1>", on_provider_release)
+        provider_tree.bind("<space>", on_provider_space)
+        tk.Button(
+            provider_button_row,
+            text="扫描 provider",
+            command=on_scan_providers,
+            bg="#f0f0f0",
+            fg=FG,
+            relief="flat",
+            padx=10,
+            pady=3,
+            font=settings_font,
+        ).pack(side="left")
+        render_provider_tree()
 
         settings_monitors = _enumerate_monitors()
         monitor_by_label = {_monitor_label(monitor): monitor for monitor in settings_monitors}
@@ -6535,6 +6841,7 @@ def run_ui() -> None:
             )
             cfg["wallpaper_image_seconds"] = int(state["wallpaper_image_seconds"])
             cfg["wallpaper_audio"] = bool(state.get("wallpaper_audio", True))
+            persist_providers(refresh=False)
             if not state.get("panel_active"):
                 cfg["x"] = root.winfo_x()
                 cfg["y"] = root.winfo_y()
@@ -7194,13 +7501,20 @@ def run_ui() -> None:
                     f"notebooks={len(notebooks)} title={win.title()!r}\n",
                     encoding="utf-8",
                 )
-                if len(notebooks) >= 2:
-                    notebooks[0].select(1)
+                def select_notebook_tab(widget: Any, title: str) -> None:
+                    for index, tab_id in enumerate(widget.tabs()):
+                        if widget.tab(tab_id, "text") == title:
+                            widget.select(index)
+                            return
+
+                if notebooks:
+                    select_notebook_tab(notebooks[0], "动态壁纸")
                     win.update()
-                    notebooks[1].select(1)
-                    win.update()
+                    if len(notebooks) >= 2:
+                        notebooks[1].select(1)
+                        win.update()
                     _capture_widget_png(win, out_dir / "settings-wallpaper.png")
-                    notebooks[0].select(0)
+                    select_notebook_tab(notebooks[0], "副屏")
                     win.update()
                     _capture_widget_png(win, out_dir / "settings-display.png")
             except Exception:
@@ -7242,7 +7556,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if cmd == "once":
-        providers = fetch_all(active_providers(), force=True)
+        once_cfg = load_config()
+        providers = fetch_all(
+            active_providers(list(once_cfg.get("providers") or DEFAULT_PROVIDERS)),
+            force=True,
+        )
         for row in iter_display_rows(providers):
             if row.failed:
                 print(f"{row.title}  更新失败")
