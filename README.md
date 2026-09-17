@@ -2,13 +2,17 @@
 
 Windows 用量 HUD：把 Claude / Codex / Grok 订阅用量（以及可选的 LiteLLM 代理额度）铺在专用副屏上，双击 Ctrl 切到文件夹动态壁纸。
 
-无标题栏、不占任务栏。没有登录凭证的 provider 不会出现占位行。设置 → **用量** 可扫描本机登录态、勾选要显示的行，并拖动调整顺序。
+无标题栏、不占任务栏。没有登录凭证的 provider 不会出现占位行。
 
 ## 截图
 
 专用副屏用量面板：
 
 ![专用副屏用量面板](docs/screenshots/panel.png)
+
+用量设置（扫描、勾选、拖动排序）：
+
+![用量设置](docs/screenshots/settings-usage.png)
 
 副屏设置：
 
@@ -18,11 +22,13 @@ Windows 用量 HUD：把 Claude / Codex / Grok 订阅用量（以及可选的 Li
 
 ![动态壁纸随机权重](docs/screenshots/settings-wallpaper.png)
 
-## 需要什么
+## 安装
 
-- Windows
-- 发行包：从 [Releases](https://github.com/iikawa0918/usage-float/releases) 下载 `usage-float-*-windows-x64.zip`，解压后双击 `UsageFloat.exe`（已内置 mpv）
-- 源码运行：Python 3.10+（带 tkinter）；动态壁纸可再执行 `.\install-mpv.ps1`
+**发行包（推荐）**：从 [Releases](https://github.com/iikawa0918/usage-float/releases) 下载 `usage-float-*-windows-x64.zip`，解压后双击 `UsageFloat.exe`。不需要安装 Python，动态壁纸用的 mpv 已打进包里。Windows 可能对未签名程序弹出 SmartScreen，选「仍要运行」即可。
+
+**源码运行**：Windows + Python 3.10+（带 tkinter）。动态壁纸再执行 `.\install-mpv.ps1`，或把 `mpv.exe` 放到 `vendor/mpv/`。
+
+## 凭证
 
 凭证都在本机，不经过第三方服务器：
 
@@ -32,7 +38,7 @@ Windows 用量 HUD：把 Claude / Codex / Grok 订阅用量（以及可选的 Li
 | Codex | `~/.codex/auth.json` |
 | Codex 第二账号 | `~/.codex-2/auth.json`（可用 `CODEX_HOME_2`） |
 | Grok | `~/.grok` 登录态 |
-| LiteLLM 代理 | 环境变量 `LLM_PROXY_API_KEY` + `LLM_PROXY_ENDPOINT`，或 `~/.usage-float/config.json` 里的同名字段。若本机装了 LiWork，也会尝试读取其 `llmProxyApiKey` / `llmProxyEndpoint` |
+| LiteLLM 代理 | 环境变量 `LLM_PROXY_API_KEY` + `LLM_PROXY_ENDPOINT`，或 `~/.usage-float/config.json` 里的 `llm_proxy_api_key` / `llm_proxy_endpoint` |
 
 第二 Codex 账号：
 
@@ -51,6 +57,8 @@ pythonw usage_float.py              # 浮窗 / 副屏
 python usage_float.py autostart on  # 开机自启
 ```
 
+冻结包同样支持 `UsageFloat.exe once` 和右键菜单里的开机自启。
+
 ## 交互
 
 | 操作 | 效果 |
@@ -64,13 +72,23 @@ python usage_float.py autostart on  # 开机自启
 | `Esc` | 退出 |
 | `Home` | 复位到主屏角落 |
 
+## 用量
+
+右键 → **设置…** → **用量**：
+
+- **扫描 provider**：读取本机登录态，列出已知 provider 以及是否已登录
+- **勾选「显示」**：只把勾上的用量画到面板上；空格键也可切换当前行
+- **拖动行**：按住名称或状态列上下拖，调整面板顺序（点第一列是勾选，不是拖动）
+
+未登录的 provider 即使勾选了也不会占位，登录之后才会出现。勾选和顺序写在 `~/.usage-float/config.json` 的 `providers` / `provider_order` / `disabled_providers`，一般用设置页改即可。
+
 ## 专用副屏
 
-右键 → **设置…** → **用量** 扫描 provider、勾选显示项并拖动排序。**副屏** 里选中目标显示器后打开「专用副屏模式」。程序用显示器硬件标识锁定副屏，重新插拔后会再铺满该屏；显示器被拔掉时临时退回悬浮窗。
+右键 → **设置…** → **副屏** → 选中目标显示器 → 打开「专用副屏模式」。程序用显示器硬件标识锁定副屏，重新插拔后会再铺满该屏；显示器被拔掉时临时退回悬浮窗。
 
 ## 动态壁纸
 
-先运行 `.\install-mpv.ps1`（或把 `mpv.exe` 放到 `vendor/mpv/`）。然后设置里添加媒体目录。
+发行包已内置 mpv。源码需先运行 `.\install-mpv.ps1`（或把 `mpv.exe` 放到 `vendor/mpv/`）。然后在设置 → **动态壁纸** 里添加媒体目录。
 
 - 支持常见 JPG / PNG / WebP / GIF / MP4 / WebM / MKV / MOV，含子目录
 - 每次进入随机首项；30 分钟以内的视频从 0:00 播，更长的优先随机章节、没有章节则随机时间
@@ -98,7 +116,7 @@ python usage_float.py autostart on  # 开机自启
 - `x-litellm-key-spend`
 - `x-litellm-key-max-budget`
 
-面板显示 `$已用/$额度`。没配 key 就不显示这一行。探测模型可用环境或代码里的默认值覆盖。
+面板显示 `$已用/$额度`。没配 key 就不显示这一行。探测模型可用环境变量覆盖。
 
 ## 配置
 
@@ -115,11 +133,13 @@ python usage_float.py autostart on  # 开机自启
   "double_ctrl_toggle": true,
   "wallpaper_folders": ["D:\\Wallpapers"],
   "wallpaper_image_seconds": 10,
-  "wallpaper_audio": true
+  "wallpaper_audio": true,
+  "llm_proxy_api_key": "",
+  "llm_proxy_endpoint": ""
 }
 ```
 
-`refresh_seconds` 下限 300 秒。Claude 遇到 429 会保留上次成功数据并标 stale。
+`refresh_seconds` 下限 300 秒。Claude 遇到 429 会保留上次成功数据并标 stale。LiteLLM 代理请用环境变量或上面两个 `llm_proxy_*` 字段，不要把真实 key 提交进仓库。
 
 ## 开发
 
@@ -130,4 +150,4 @@ python -m unittest test_usage_float.py
 
 ## 许可
 
-MIT。mpv 为 GPL，由 `install-mpv.ps1` 另行下载，不包含在本仓库源码树里。
+MIT。mpv 为 GPL：源码树不包含二进制，由 `install-mpv.ps1` 下载；GitHub Release 的 zip 会附带已下载的 mpv，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

@@ -905,7 +905,7 @@ class LlmProxyUsageTests(unittest.TestCase):
             usage_float_module._spend_looks_like_this_request(0.1047, 2e-07)
         )
 
-    def test_liwork_key_makes_the_row_available(self) -> None:
+    def test_sidecar_proxy_file_makes_the_row_available(self) -> None:
         with TemporaryDirectory() as temp_dir:
             orca = Path(temp_dir) / "orca-data.json"
             orca.write_text(

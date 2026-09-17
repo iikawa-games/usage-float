@@ -134,8 +134,7 @@ GROK_BILLING_URL = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCredits
 
 # Many LiteLLM virtual keys cannot call /key/info. Spend and budget come back
 # on actual LLM responses as x-litellm-key-spend / x-litellm-key-max-budget.
-# Probe models are overridable; leave empty endpoint unless env/config/LiWork
-# supplies one.
+# Probe models are overridable; leave empty unless env or config supplies an endpoint.
 LLM_PROXY_DEFAULT_ENDPOINT = ""
 LLM_PROXY_EMBED_MODEL = "gemini-embedding-2"
 LLM_PROXY_CHAT_FALLBACK_MODEL = "glm-5.3-flash"
@@ -2818,7 +2817,7 @@ def _read_liwork_llm_proxy() -> tuple[str, str]:
 
 
 def read_llm_proxy_credentials() -> tuple[str, str] | tuple[None, None]:
-    """Return (api_key, openai_base) from env, usage-float config, or LiWork."""
+    """Return (api_key, openai_base) from env or usage-float config."""
     key = str(os.environ.get("LLM_PROXY_API_KEY") or "").strip()
     endpoint = str(os.environ.get("LLM_PROXY_ENDPOINT") or "").strip()
     if not key or not endpoint:
@@ -7507,16 +7506,26 @@ def run_ui() -> None:
                             widget.select(index)
                             return
 
-                if notebooks:
-                    select_notebook_tab(notebooks[0], "动态壁纸")
+                def capture_main_tab(title: str, path: Path, inner_title: str | None = None) -> None:
+                    select_notebook_tab(notebooks[0], title)
+                    win.update_idletasks()
                     win.update()
-                    if len(notebooks) >= 2:
-                        notebooks[1].select(1)
+                    if inner_title and len(notebooks) >= 2:
+                        select_notebook_tab(notebooks[1], inner_title)
+                        win.update_idletasks()
                         win.update()
-                    _capture_widget_png(win, out_dir / "settings-wallpaper.png")
-                    select_notebook_tab(notebooks[0], "副屏")
+                    time.sleep(0.35)
                     win.update()
-                    _capture_widget_png(win, out_dir / "settings-display.png")
+                    _capture_widget_png(win, path)
+
+                if notebooks:
+                    capture_main_tab("用量", out_dir / "settings-usage.png")
+                    capture_main_tab("副屏", out_dir / "settings-display.png")
+                    capture_main_tab(
+                        "动态壁纸",
+                        out_dir / "settings-wallpaper.png",
+                        "随机权重",
+                    )
             except Exception:
                 log_path.write_text(traceback.format_exc(), encoding="utf-8")
             finally:
