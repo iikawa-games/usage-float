@@ -967,6 +967,8 @@ class LlmProxyUsageTests(unittest.TestCase):
             return_value=("sk-test", "https://llm-proxy.example.com/v1"),
         ), patch.object(
             usage_float_module, "_llm_proxy_probe", fake_probe
+        ), patch.object(
+            usage_float_module, "_llm_proxy_budget_settings", return_value=("30d", "UTC")
         ), patch.object(usage_float_module, "cache_put_provider", lambda _p: None):
             usage = usage_float_module.fetch_llmproxy_usage()
 
@@ -974,9 +976,51 @@ class LlmProxyUsageTests(unittest.TestCase):
         self.assertTrue(usage.available)
         self.assertAlmostEqual(usage.windows[0].used_pct, 10.0)
         self.assertEqual(usage.summary, "$20/200")
+        self.assertIsNotNone(usage.windows[0].resets_at)
         rows = iter_display_rows([usage])
         self.assertEqual(rows[0].title, "llmproxy")
         self.assertEqual(rows[0].summary, "$20/200")
+        self.assertIsNotNone(rows[0].resets_at)
+        self.assertTrue(format_remaining(rows[0].resets_at))
+
+    def test_monthly_budget_resets_on_the_first(self) -> None:
+        now = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+        reset = usage_float_module.next_llm_proxy_budget_reset(
+            "30d", now=now, timezone_name="UTC"
+        )
+        self.assertEqual(reset, datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc))
+        on_the_first = usage_float_module.next_llm_proxy_budget_reset(
+            "1mo",
+            now=datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc),
+            timezone_name="UTC",
+        )
+        self.assertEqual(on_the_first, datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc))
+
+    def test_daily_and_weekly_budget_resets_align_to_midnight(self) -> None:
+        wednesday = datetime(2026, 9, 16, 15, 30, tzinfo=timezone.utc)
+        self.assertEqual(
+            usage_float_module.next_llm_proxy_budget_reset(
+                "1d", now=wednesday, timezone_name="UTC"
+            ),
+            datetime(2026, 9, 17, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            usage_float_module.next_llm_proxy_budget_reset(
+                "7d", now=wednesday, timezone_name="UTC"
+            ),
+            datetime(2026, 9, 21, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_header_reset_timestamp_wins_over_duration(self) -> None:
+        iso = usage_float_module.resolve_llm_proxy_resets_at(
+            {"x-litellm-key-budget-reset-at": "2026-10-01T00:00:00Z"},
+            now=datetime(2026, 9, 17, tzinfo=timezone.utc),
+            duration="1d",
+            timezone_name="UTC",
+        )
+        self.assertIsNotNone(iso)
+        parsed = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        self.assertEqual(parsed.date(), datetime(2026, 10, 1).date())
 
 
 class ProviderConfigTests(unittest.TestCase):

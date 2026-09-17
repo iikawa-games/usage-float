@@ -27,10 +27,11 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Paths / constants
@@ -138,6 +139,19 @@ GROK_BILLING_URL = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCredits
 LLM_PROXY_DEFAULT_ENDPOINT = ""
 LLM_PROXY_EMBED_MODEL = "gemini-embedding-2"
 LLM_PROXY_CHAT_FALLBACK_MODEL = "glm-5.3-flash"
+# Virtual keys often cannot call /key/info. LiteLLM 30d/1mo budgets reset on the
+# 1st of the month at midnight in the proxy timezone (UTC unless configured).
+LLM_PROXY_BUDGET_DURATION_DEFAULT = "30d"
+LLM_PROXY_TIMEZONE_DEFAULT = "UTC"
+LLM_PROXY_RESET_HEADERS = (
+    "x-litellm-key-budget-reset-at",
+    "x-litellm-budget-reset-at",
+    "x-litellm-key-reset-at",
+)
+LLM_PROXY_DURATION_HEADERS = (
+    "x-litellm-key-budget-duration",
+    "x-litellm-budget-duration",
+)
 
 REFRESH_SECONDS = 300
 CLAUDE_429_BACKOFF_SECONDS = 900
@@ -2870,6 +2884,163 @@ def parse_llm_proxy_spend_headers(
     return spend, budget, cost
 
 
+def _llm_proxy_zoneinfo(name: str | None) -> timezone | ZoneInfo:
+    text = (name or LLM_PROXY_TIMEZONE_DEFAULT).strip() or LLM_PROXY_TIMEZONE_DEFAULT
+    if text.upper() == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(text)
+    except Exception:
+        return timezone.utc
+
+
+def _normalize_llm_proxy_budget_duration(raw: str | None) -> str:
+    text = (raw or "").strip().lower()
+    aliases = {
+        "hourly": "1h",
+        "daily": "1d",
+        "weekly": "7d",
+        "monthly": "30d",
+        "24h": "1d",
+        "1w": "7d",
+        "1mo": "30d",
+    }
+    return aliases.get(text, text)
+
+
+def _parse_llm_proxy_duration(raw: str | None) -> tuple[int, str] | None:
+    text = _normalize_llm_proxy_budget_duration(raw)
+    if not text:
+        return None
+    index = 0
+    while index < len(text) and text[index].isdigit():
+        index += 1
+    if index == 0 or index == len(text):
+        return None
+    try:
+        value = int(text[:index])
+    except ValueError:
+        return None
+    unit = text[index:]
+    if unit not in {"s", "m", "h", "d", "w", "mo"}:
+        return None
+    return value, unit
+
+
+def next_llm_proxy_budget_reset(
+    duration: str | None,
+    *,
+    now: datetime | None = None,
+    timezone_name: str | None = None,
+) -> datetime | None:
+    """Next LiteLLM-style budget reset (1d midnight, 7d Monday, 30d 1st of month)."""
+    parsed = _parse_llm_proxy_duration(duration)
+    if parsed is None:
+        return None
+    value, unit = parsed
+    tzinfo = _llm_proxy_zoneinfo(timezone_name)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(tzinfo)
+    midnight = current.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def at_midnight(moment: datetime) -> datetime:
+        return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if unit == "d" and value == 1:
+        candidate = midnight
+        return candidate + timedelta(days=1) if candidate <= current else candidate
+    if (unit == "d" and value == 7) or (unit == "w" and value == 1):
+        days_until_monday = (7 - current.weekday()) % 7
+        candidate = midnight + timedelta(days=days_until_monday)
+        return candidate + timedelta(days=7) if candidate <= current else candidate
+    if (unit == "d" and value == 30) or (unit == "mo" and value == 1):
+        candidate = midnight.replace(day=1)
+        if candidate <= current:
+            if candidate.month == 12:
+                candidate = candidate.replace(year=candidate.year + 1, month=1)
+            else:
+                candidate = candidate.replace(month=candidate.month + 1)
+        return candidate
+    if unit == "h":
+        return current.replace(minute=0, second=0, microsecond=0) + timedelta(hours=value)
+    if unit == "m":
+        return current.replace(second=0, microsecond=0) + timedelta(minutes=value)
+    if unit == "s":
+        return current.replace(microsecond=0) + timedelta(seconds=value)
+    if unit == "d":
+        return at_midnight(midnight + timedelta(days=value))
+    if unit == "w":
+        return at_midnight(midnight + timedelta(weeks=value))
+    return None
+
+
+def _parse_llm_proxy_reset_timestamp(raw: str | None) -> str | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        stamp = float(text)
+        if stamp > 1e12:
+            stamp /= 1000.0
+        if stamp > 1e9:
+            return datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat()
+    except ValueError:
+        pass
+    parsed = parse_iso(text)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
+
+
+def _llm_proxy_budget_settings() -> tuple[str, str]:
+    duration = str(os.environ.get("LLM_PROXY_BUDGET_DURATION") or "").strip()
+    timezone_name = str(os.environ.get("LLM_PROXY_TIMEZONE") or "").strip()
+    try:
+        if CONFIG_PATH.exists():
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                duration = duration or str(data.get("llm_proxy_budget_duration") or "").strip()
+                timezone_name = timezone_name or str(
+                    data.get("llm_proxy_timezone") or ""
+                ).strip()
+    except Exception:
+        pass
+    return (
+        duration or LLM_PROXY_BUDGET_DURATION_DEFAULT,
+        timezone_name or LLM_PROXY_TIMEZONE_DEFAULT,
+    )
+
+
+def resolve_llm_proxy_resets_at(
+    headers: dict[str, str] | None = None,
+    *,
+    now: datetime | None = None,
+    duration: str | None = None,
+    timezone_name: str | None = None,
+) -> str | None:
+    lowered = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    for key in LLM_PROXY_RESET_HEADERS:
+        parsed = _parse_llm_proxy_reset_timestamp(lowered.get(key))
+        if parsed:
+            return parsed
+    header_duration = None
+    for key in LLM_PROXY_DURATION_HEADERS:
+        raw = lowered.get(key)
+        if raw:
+            header_duration = raw
+            break
+    reset = next_llm_proxy_budget_reset(
+        header_duration or duration or LLM_PROXY_BUDGET_DURATION_DEFAULT,
+        now=now,
+        timezone_name=timezone_name,
+    )
+    return reset.isoformat() if reset is not None else None
+
+
 def _round_dollars(value: float) -> int:
     """Half-up dollar rounding (2.5 → 3), not banker's rounding or truncation."""
     return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
@@ -2924,6 +3095,7 @@ def fetch_llmproxy_usage() -> ProviderUsage:
     )
     spend: float | None = None
     budget: float | None = None
+    headers: dict[str, str] = {}
     for kind, model in probes:
         status, headers = _llm_proxy_probe(base, key, model=model, kind=kind)
         if status != 200:
@@ -2943,11 +3115,28 @@ def fetch_llmproxy_usage() -> ProviderUsage:
             error="更新失败",
         )
 
+    duration, timezone_name = _llm_proxy_budget_settings()
+    resets_at = resolve_llm_proxy_resets_at(
+        headers,
+        duration=duration,
+        timezone_name=timezone_name,
+    )
+
     if budget is None or budget <= 0:
         result = ProviderUsage(
             provider_id="llmproxy",
             display_name="llmproxy",
             summary=format_llm_proxy_spend(spend),
+            windows=[
+                UsageWindow(
+                    id="spend",
+                    label="额度",
+                    used_pct=0.0,
+                    resets_at=resets_at,
+                )
+            ]
+            if resets_at
+            else [],
             available=True,
             fetched_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -2965,6 +3154,7 @@ def fetch_llmproxy_usage() -> ProviderUsage:
                 id="spend",
                 label="额度",
                 used_pct=used_pct,
+                resets_at=resets_at,
             )
         ],
         available=True,
@@ -5602,7 +5792,8 @@ def run_ui() -> None:
         state["settings_win"] = win
         win.title("UsageFloat 设置")
         win.configure(bg=BG)
-        win.resizable(False, False)
+        win.resizable(True, True)
+        win.minsize(460, 620)
         # This stays a normal independent window on the primary display. Setting
         # topmost/transient before its first map makes Tk recreate the native
         # wrapper across two DPI contexts; that loses the first menu invocation
@@ -5621,7 +5812,7 @@ def run_ui() -> None:
             )
         except Exception:
             pass
-        notebook = ttk.Notebook(shell, style="UsageFloat.TNotebook", width=430, height=445)
+        notebook = ttk.Notebook(shell, style="UsageFloat.TNotebook", width=450, height=580)
         notebook.pack(fill="both", expand=True)
         providers_tab = tk.Frame(notebook, bg=BG)
         display_tab = tk.Frame(notebook, bg=BG)
@@ -5641,10 +5832,8 @@ def run_ui() -> None:
         wallpaper_notebook = ttk.Notebook(
             wallpaper_tab,
             style="UsageFloat.TNotebook",
-            width=402,
-            height=402,
         )
-        wallpaper_notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        wallpaper_notebook.pack(fill="both", expand=True, padx=10, pady=8)
         directories_tab = tk.Frame(wallpaper_notebook, bg=BG)
         weights_tab = tk.Frame(wallpaper_notebook, bg=BG)
         wallpaper_notebook.add(directories_tab, text="目录")
@@ -5690,7 +5879,7 @@ def run_ui() -> None:
             provider_list_frame,
             columns=("enabled", "name", "status"),
             show="headings",
-            height=9,
+            height=7,
             selectmode="browse",
         )
         provider_tree.heading("enabled", text="显示")
@@ -6766,7 +6955,7 @@ def run_ui() -> None:
             bg=BG,
             font=settings_font_small,
             anchor="w",
-            wraplength=260,
+            wraplength=400,
             justify="left",
         )
         opacity_hint.pack(fill="x", pady=(0, 8))
@@ -6796,7 +6985,7 @@ def run_ui() -> None:
             fg=FG_MUTED,
             bg=BG,
             font=settings_font_small,
-            wraplength=260,
+            wraplength=400,
             justify="left",
             anchor="w",
         ).pack(fill="x", pady=(0, 10))
@@ -7492,7 +7681,7 @@ def run_ui() -> None:
                 walk(win)
                 for notebook in notebooks:
                     notebook.configure(height=520)
-                win.geometry("450x680")
+                win.geometry("480x740")
                 win.update()
                 out_dir = Path(__file__).resolve().parent / "docs" / "screenshots"
                 out_dir.mkdir(parents=True, exist_ok=True)
