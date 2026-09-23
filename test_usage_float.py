@@ -1415,6 +1415,29 @@ class ClaudeResetTests(unittest.TestCase):
             reset = usage_float_module.parse_claude_session_reset(dict(live, **change))
             self.assertFalse(reset.claimable, change)
 
+    def test_a_rate_limited_read_shows_the_last_cached_numbers(self) -> None:
+        with TemporaryDirectory() as temp_dir, patch.object(
+            usage_float_module, "CACHE_PATH", Path(temp_dir) / "cache.json"
+        ), patch.object(
+            usage_float_module, "read_claude_oauth", return_value=({"accessToken": "t"}, None)
+        ), patch.object(
+            usage_float_module, "claude_authorized_json", return_value=(429, None)
+        ):
+            self.assertFalse(usage_float_module.fetch_claude_usage(force=True).available)
+
+            good = self.claude_provider(self.block())
+            good.available = True
+            good.fetched_at = datetime.now(timezone.utc).isoformat()
+            usage_float_module.cache_put_provider(good)
+            shown = usage_float_module.fetch_claude_usage(force=True)
+            # Backoff is now set, so the unforced refresh uses the cache too.
+            backed_off = usage_float_module.fetch_claude_usage()
+
+        for result in (shown, backed_off):
+            self.assertTrue(result.available)
+            self.assertTrue(result.stale)
+            self.assertEqual([w.id for w in result.windows], ["weekly_fable", "five_hour"])
+
     def test_session_reset_is_read_from_the_at_wall_usage_query(self) -> None:
         # The regular usage read returns juniper_tide as null.
         calls = []

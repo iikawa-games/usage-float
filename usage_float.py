@@ -44,7 +44,7 @@ APP_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", HOME / ".claude"))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 CODEX_HOME_2 = Path(os.environ.get("CODEX_HOME_2", HOME / ".codex-2"))
@@ -2795,15 +2795,27 @@ def claim_claude_session_reset() -> ClaudeResetClaim:
     )
 
 
+def _claude_rate_limited_usage() -> ProviderUsage:
+    """What to show while the usage endpoint answers 429.
+
+    The last good read beats a failed row: the numbers only drift slowly, and
+    the backoff lifts on its own. Past a day old they are too wrong to show.
+    """
+    cached = cache_get_provider("claude")
+    if cached is not None and time.time() - _iso_epoch(cached.fetched_at, 0.0) < 86400:
+        return cached
+    return ProviderUsage(
+        provider_id="claude",
+        display_name="claude",
+        available=False,
+        error="更新失败",
+        stale=True,
+    )
+
+
 def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
     if claude_in_backoff() and not force:
-        return ProviderUsage(
-            provider_id="claude",
-            display_name="claude",
-            available=False,
-            error="更新失败",
-            stale=True,
-        )
+        return _claude_rate_limited_usage()
 
     oauth, _cred_path = read_claude_oauth()
     if not oauth:
@@ -2819,13 +2831,7 @@ def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
 
     if status == 429:
         set_claude_backoff()
-        return ProviderUsage(
-            provider_id="claude",
-            display_name="claude",
-            available=False,
-            error="更新失败",
-            stale=True,
-        )
+        return _claude_rate_limited_usage()
 
     if status != 200 or not isinstance(payload, dict):
         return ProviderUsage(
