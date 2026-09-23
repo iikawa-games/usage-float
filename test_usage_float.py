@@ -45,10 +45,13 @@ from usage_float import (
     _report_tk_callback_exception,
     _tk_geometry,
     _wallpaper_path_key,
+    claude_reset_status,
     consume_codex_reset_card,
     fetch_codex_reset_cards,
     format_remaining,
     iter_display_rows,
+    parse_claude_reset_status,
+    row_opens_reset_ui,
     ProviderUsage,
     UsageWindow,
 )
@@ -1181,6 +1184,176 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertEqual(rows[0]["label"], "Grok")
         self.assertTrue(rows[0]["available"])
         self.assertFalse(rows[3]["available"])
+
+
+
+class ClaudeResetTests(unittest.TestCase):
+    # Shape captured live from /api/oauth/usage?cedar_ember=1&skip_spend=1.
+    LIVE_GRANT = {
+        "id": "opus55-launch-promax-20260921",
+        "label": "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max",
+        "resets_total": 1,
+        "resets_left": 1,
+        "starts_at": "2026-09-22T16:00:00+00:00",
+        "ends_at": "2026-10-22T16:00:00+00:00",
+        "clears": ["five_hour", "seven_day", "seven_day_overage_included"],
+        "paused": False,
+        "usable_now": True,
+        "use_requires_limit": False,
+        "blocking": [],
+    }
+
+    def block(self, **overrides):
+        payload = {
+            "eligible": True,
+            "ineligible_reason": None,
+            "at_limit": False,
+            "exhausted": [],
+            "grants": [dict(self.LIVE_GRANT)],
+            "next_grant_id": self.LIVE_GRANT["id"],
+            "weekly_resets_at": "2026-09-24T21:00:00+00:00",
+            "cooldown_until": None,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_live_grant_shape_is_read_into_the_fields_the_hud_shows(self) -> None:
+        status = parse_claude_reset_status(self.block())
+
+        self.assertTrue(status.available)
+        self.assertEqual(status.resets_left, 1)
+        self.assertTrue(status.usable_now)
+        self.assertFalse(status.use_requires_limit)
+        self.assertEqual(status.expires_at, "2026-10-22T16:00:00+00:00")
+        self.assertEqual(status.weekly_resets_at, "2026-09-24T21:00:00+00:00")
+        self.assertIn("Opus 5.5", status.label or "")
+        self.assertEqual(
+            status.clears, ("five_hour", "seven_day", "seven_day_overage_included")
+        )
+
+    def test_an_ineligible_account_reports_its_reason_and_no_resets(self) -> None:
+        status = parse_claude_reset_status(
+            {
+                "eligible": False,
+                "ineligible_reason": "surface",
+                "at_limit": False,
+                "grants": [],
+                "next_grant_id": None,
+                "weekly_resets_at": None,
+                "cooldown_until": None,
+            }
+        )
+
+        self.assertFalse(status.available)
+        self.assertEqual(status.resets_left, 0)
+        self.assertEqual(status.ineligible_reason, "surface")
+
+    def test_spent_and_paused_grants_do_not_count_as_available(self) -> None:
+        spent = dict(self.LIVE_GRANT, resets_left=0)
+        paused = dict(self.LIVE_GRANT, id="paused", paused=True)
+
+        status = parse_claude_reset_status(self.block(grants=[spent, paused]))
+
+        self.assertFalse(status.available)
+        self.assertEqual(status.resets_left, 0)
+
+    def test_the_grant_that_lapses_first_supplies_the_headline(self) -> None:
+        late = dict(
+            self.LIVE_GRANT,
+            id="late",
+            label="late one",
+            ends_at="2026-12-01T00:00:00+00:00",
+            clears=["seven_day"],
+        )
+        soon = dict(
+            self.LIVE_GRANT,
+            id="soon",
+            label="soon one",
+            resets_left=2,
+            ends_at="2026-10-01T00:00:00+00:00",
+            clears=["five_hour"],
+        )
+
+        status = parse_claude_reset_status(self.block(grants=[late, soon]))
+
+        self.assertEqual(status.resets_left, 3)
+        self.assertEqual(status.label, "soon one")
+        self.assertEqual(status.expires_at, "2026-10-01T00:00:00+00:00")
+        self.assertEqual(status.clears, ("five_hour",))
+
+    def test_camel_case_and_epoch_grants_are_accepted(self) -> None:
+        grant = {
+            "grantId": "camel",
+            "resetsLeft": 2,
+            "endsAt": 1792000000,
+            "usableNow": True,
+            "useRequiresLimit": True,
+            "limitTypes": ["five_hour"],
+        }
+
+        status = parse_claude_reset_status({"grants": [grant]})
+
+        self.assertEqual(status.resets_left, 2)
+        self.assertTrue(status.usable_now)
+        self.assertTrue(status.use_requires_limit)
+        self.assertEqual(status.clears, ("five_hour",))
+        self.assertIsNotNone(status.expires_at)
+
+    def test_a_missing_block_degrades_to_nothing_available(self) -> None:
+        for value in (None, {}, [], "nope"):
+            status = parse_claude_reset_status(value)
+            self.assertFalse(status.available)
+            self.assertEqual(status.resets_left, 0)
+
+    def claude_provider(self, block) -> ProviderUsage:
+        return ProviderUsage(
+            provider_id="claude",
+            display_name="claude",
+            windows=[
+                UsageWindow(id="weekly_fable", label="fable 7d", used_pct=66.0),
+                UsageWindow(id="five_hour", label="5h", used_pct=16.0),
+            ],
+            reset_block=block,
+        )
+
+    def test_only_the_refillable_window_is_marked_on_the_hud(self) -> None:
+        rows = iter_display_rows([self.claude_provider(self.block())])
+        by_window = {row.window_id: row for row in rows}
+
+        self.assertTrue(by_window["five_hour"].reset_available)
+        # The grant clears the account-wide seven_day window, which this HUD
+        # does not render; the model-scoped weekly row must stay unmarked.
+        self.assertFalse(by_window["weekly_fable"].reset_available)
+
+    def test_no_grant_leaves_every_row_unmarked(self) -> None:
+        rows = iter_display_rows([self.claude_provider(self.block(grants=[]))])
+
+        self.assertFalse(any(row.reset_available for row in rows))
+
+    def test_only_the_claude_session_row_opens_the_reset_dialog(self) -> None:
+        rows = iter_display_rows([self.claude_provider(self.block())])
+        clickable = {row.window_id for row in rows if row_opens_reset_ui(row)}
+
+        self.assertEqual(clickable, {"five_hour"})
+
+    def test_reset_block_survives_the_usage_cache_round_trip(self) -> None:
+        block = self.block()
+        restored = usage_float_module._provider_from_dict(
+            usage_float_module._provider_to_dict(self.claude_provider(block))
+        )
+
+        self.assertEqual(restored.reset_block, block)
+        self.assertEqual(claude_reset_status(restored).resets_left, 1)
+
+    def test_the_usage_request_identifies_as_the_installed_cli(self) -> None:
+        # Without this the server answers ineligible_reason="surface".
+        headers = usage_float_module.claude_request_headers("token")
+        version = usage_float_module.claude_cli_version()
+
+        self.assertEqual(headers["anthropic-client-platform"], "cli")
+        self.assertEqual(headers["anthropic-client-version"], version)
+        self.assertTrue(headers["User-Agent"].startswith(f"claude-cli/{version}"))
+        self.assertIn("cedar_ember=1", usage_float_module.CLAUDE_USAGE_RESET_URL)
 
 
 if __name__ == "__main__":

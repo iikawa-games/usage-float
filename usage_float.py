@@ -67,6 +67,24 @@ CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+# "cedar-ember" is Claude Code's internal name for the weekly /limit-reset
+# entitlement. Its status rides along on the usage endpoint as a query flag,
+# so reading it costs no extra call against an API that answers 429 easily.
+CLAUDE_USAGE_RESET_URL = f"{CLAUDE_USAGE_URL}?cedar_ember=1&skip_spend=1"
+# The server only hands that block to the CLI surface: a plain request comes
+# back with ineligible_reason="surface". Report the version actually installed
+# so the gate reflects this machine instead of a number frozen into the file.
+CLAUDE_CLI_VERSION_FALLBACK = "2.1.278"
+CLAUDE_CLI_PACKAGE_PATHS: tuple[Path, ...] = (
+    Path(os.environ.get("APPDATA", str(HOME)))
+    / "npm"
+    / "node_modules"
+    / "@anthropic-ai"
+    / "claude-code"
+    / "package.json",
+    CLAUDE_HOME / "local" / "node_modules" / "@anthropic-ai" / "claude-code" / "package.json",
+    HOME / ".npm-global" / "lib" / "node_modules" / "@anthropic-ai" / "claude-code" / "package.json",
+)
 
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -2096,6 +2114,10 @@ class ProviderUsage:
     fetched_at: str | None = None
     # Free-form one-line summary override (e.g. grok credits without %)
     summary: str | None = None
+    # Raw provider-specific reset entitlement block (Claude's cedar_ember).
+    # Kept as the untouched payload so a field added upstream survives the
+    # cache round-trip without a schema change here.
+    reset_block: dict[str, Any] | None = None
 
 
 def _provider_to_dict(p: ProviderUsage) -> dict[str, Any]:
@@ -2117,6 +2139,7 @@ def _provider_to_dict(p: ProviderUsage) -> dict[str, Any]:
         "stale": p.stale,
         "fetched_at": p.fetched_at,
         "summary": p.summary,
+        "reset_block": p.reset_block,
     }
 
 
@@ -2141,6 +2164,7 @@ def _provider_from_dict(d: dict[str, Any]) -> ProviderUsage:
         stale=bool(d.get("stale", False)),
         fetched_at=d.get("fetched_at"),
         summary=d.get("summary"),
+        reset_block=d.get("reset_block") if isinstance(d.get("reset_block"), dict) else None,
     )
 
 
@@ -2300,6 +2324,155 @@ def refresh_claude_token(refresh_token: str) -> dict[str, Any] | None:
     return payload
 
 
+def claude_cli_version() -> str:
+    """Version of the Claude Code CLI installed on this machine.
+
+    The weekly-reset block is gated on the caller looking like a recent CLI, so
+    a stale number would silently turn the field off. Read it fresh on every
+    call — the CLI self-updates under a long-running HUD, and re-reading a 1 KB
+    manifest once per refresh is cheaper than serving a version that has since
+    dropped below the gate.
+    """
+    for path in CLAUDE_CLI_PACKAGE_PATHS:
+        try:
+            if not path.exists():
+                continue
+            data = json.loads(path.read_text(encoding="utf-8"))
+            found = str((data or {}).get("version") or "").strip()
+            if found:
+                return found
+        except Exception:
+            continue
+    return CLAUDE_CLI_VERSION_FALLBACK
+
+
+def claude_request_headers(token: str) -> dict[str, str]:
+    version = claude_cli_version()
+    return {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": CLAUDE_OAUTH_BETA,
+        # Identify as the CLI surface; without this the response reports
+        # ineligible_reason="surface" and the reset block is always empty.
+        "User-Agent": f"claude-cli/{version} (external, cli)",
+        "anthropic-client-platform": "cli",
+        "anthropic-client-version": version,
+    }
+
+
+@dataclass
+class ClaudeResetStatus:
+    """Claude's weekly /limit-reset entitlement, as shown by the HUD."""
+
+    eligible: bool = False
+    ineligible_reason: str | None = None
+    at_limit: bool = False
+    resets_left: int = 0
+    usable_now: bool = False
+    use_requires_limit: bool = False
+    expires_at: str | None = None
+    weekly_resets_at: str | None = None
+    cooldown_until: str | None = None
+    # Describes the grant that lapses first: Anthropic ships a human label
+    # ("Claude Opus 5.5 launch: one usage-limit reset…") and the list of
+    # windows it refills.
+    label: str | None = None
+    clears: tuple[str, ...] = ()
+
+    @property
+    def available(self) -> bool:
+        return self.resets_left > 0
+
+
+# Appended to a usage number that an unused reset can refill.
+RESET_AVAILABLE_MARK = "\u21ba"
+
+CLAUDE_RESET_WINDOW_TEXT = {
+    "five_hour": "5 小时会话",
+    "seven_day": "7 天周额度",
+    "seven_day_overage_included": "7 天周额度（含超额）",
+    "seven_day_opus": "Opus 周额度",
+    "seven_day_sonnet": "Sonnet 周额度",
+}
+
+
+CLAUDE_RESET_REASON_TEXT = {
+    "surface": "当前客户端不被允许读取重置额度",
+    "cli_version": "Claude Code 版本过低，升级后才会发放",
+    "plan": "当前订阅方案不包含用量重置",
+    "no_profile_scope": "登录凭证缺少所需权限",
+    "not_authorized": "账号未获授权",
+}
+
+
+def _claude_grant_int(grant: dict[str, Any], *names: str) -> int:
+    value = _first_present(grant, *names)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_claude_reset_status(block: Any) -> ClaudeResetStatus:
+    """Read the cedar_ember block into the few fields the HUD actually shows."""
+    if not isinstance(block, dict):
+        return ClaudeResetStatus()
+    reason = _first_present(block, "ineligible_reason", "ineligibleReason")
+    status = ClaudeResetStatus(
+        eligible=bool(_first_present(block, "eligible") or False),
+        ineligible_reason=str(reason) if reason else None,
+        at_limit=bool(_first_present(block, "at_limit", "atLimit") or False),
+        weekly_resets_at=_iso_timestamp(
+            _first_present(block, "weekly_resets_at", "weeklyResetsAt")
+        ),
+        cooldown_until=_iso_timestamp(
+            _first_present(block, "cooldown_until", "cooldownUntil")
+        ),
+    )
+
+    total = 0
+    soonest_expiry: str | None = None
+    for grant in _first_present(block, "grants") or []:
+        if not isinstance(grant, dict):
+            continue
+        left = _claude_grant_int(grant, "resets_left", "resetsLeft")
+        if left <= 0 or _first_present(grant, "paused"):
+            continue
+        total += left
+        if _first_present(grant, "usable_now", "usableNow"):
+            status.usable_now = True
+        if _first_present(grant, "use_requires_limit", "useRequiresLimit"):
+            status.use_requires_limit = True
+        ends_at = _iso_timestamp(_first_present(grant, "ends_at", "endsAt"))
+        # Describe the deadline that lapses first — that is the one worth acting on.
+        if ends_at is None and soonest_expiry is not None:
+            continue
+        if ends_at is not None and soonest_expiry is not None and _iso_epoch(
+            ends_at, float("inf")
+        ) >= _iso_epoch(soonest_expiry, float("inf")):
+            continue
+        soonest_expiry = ends_at or soonest_expiry
+        label = _first_present(grant, "label", "title", "name")
+        status.label = str(label).strip() if label else None
+        status.clears = tuple(
+            str(window)
+            for window in (_first_present(grant, "clears", "limit_types", "limitTypes") or [])
+            if window
+        )
+
+    # Some responses only carry the rolled-up count, with no per-grant rows.
+    status.resets_left = total or _claude_grant_int(
+        block, "resets_left_total", "resetsLeftTotal", "resets_left"
+    )
+    status.expires_at = soonest_expiry
+    return status
+
+
+def claude_reset_status(provider: ProviderUsage | None) -> ClaudeResetStatus:
+    if provider is None:
+        return ClaudeResetStatus()
+    return parse_claude_reset_status(provider.reset_block)
+
+
 def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
     if claude_in_backoff() and not force:
         return ProviderUsage(
@@ -2324,11 +2497,8 @@ def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
 
     def call(token: str) -> tuple[int, Any]:
         return http_json(
-            CLAUDE_USAGE_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "anthropic-beta": CLAUDE_OAUTH_BETA,
-            },
+            CLAUDE_USAGE_RESET_URL,
+            headers=claude_request_headers(token),
         )
 
     status, payload = call(access)
@@ -2420,6 +2590,7 @@ def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
             )
         )
 
+    reset_block = payload.get("cedar_ember")
     result = ProviderUsage(
         provider_id="claude",
         display_name="claude",
@@ -2427,6 +2598,7 @@ def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
         windows=windows,
         available=True,
         fetched_at=datetime.now(timezone.utc).isoformat(),
+        reset_block=reset_block if isinstance(reset_block, dict) else None,
     )
     clear_claude_backoff()
     cache_put_provider(result)
@@ -2605,7 +2777,7 @@ def _first_present(data: dict[str, Any], *names: str) -> Any:
     return None
 
 
-def _codex_reset_card_timestamp(value: Any) -> str | None:
+def _iso_timestamp(value: Any) -> str | None:
     """Normalise a card timestamp to ISO-8601 so parse_iso() can read it.
 
     The endpoint has shipped both epoch seconds and RFC 3339 strings, so accept
@@ -2644,10 +2816,10 @@ def _codex_reset_card_from_dict(data: dict[str, Any]) -> CodexResetCard | None:
             else CODEX_RESET_CARD_STATUS_AVAILABLE
         ),
         reset_type=str(reset_type) if reset_type else None,
-        granted_at=_codex_reset_card_timestamp(
+        granted_at=_iso_timestamp(
             _first_present(data, "granted_at", "grantedAt")
         ),
-        expires_at=_codex_reset_card_timestamp(
+        expires_at=_iso_timestamp(
             _first_present(data, "expires_at", "expiresAt")
         ),
     )
@@ -3508,6 +3680,20 @@ class DisplayRow:
     summary: str | None = None  # free text on the right (e.g. failure)
     failed: bool = False
     provider_id: str = ""
+    window_id: str = ""
+    # Claude only: this window can be refilled by an unused /limit-reset grant.
+    reset_available: bool = False
+
+
+def row_opens_reset_ui(row: DisplayRow) -> bool:
+    """Whether clicking this row's number should open a reset dialog.
+
+    Every Codex account has cards to list. Claude only has the one weekly
+    session reset, so only its 5h row is wired up.
+    """
+    if row.provider_id in CODEX_ACCOUNT_BY_ID:
+        return True
+    return row.provider_id == "claude" and row.window_id == "five_hour"
 
 
 def iter_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
@@ -3543,6 +3729,8 @@ def iter_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
 
         if p.windows:
             multi = len(p.windows) > 1
+            reset = claude_reset_status(p) if p.provider_id == "claude" else None
+            refillable = set(reset.clears) if reset and reset.available else set()
             # Allow 5h + 7d + scoped model weeks (e.g. fable 7d)
             for w in p.windows[:5]:
                 # "claude 5h" / "claude 7d" / "fable 7d" (scoped rows omit provider prefix)
@@ -3559,6 +3747,8 @@ def iter_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                         resets_at=w.resets_at,
                         summary=p.summary if not multi else None,
                         provider_id=p.provider_id,
+                        window_id=w.id,
+                        reset_available=w.id in refillable,
                     )
                 )
             continue
@@ -4355,12 +4545,13 @@ def run_ui() -> None:
         "render_job": None,
         "refresh_control": None,
         "refresh_hitbox": None,
-        "codex_click_targets": [],
-        "codex_click_widgets": [],
-        "codex_hitboxes": [],
-        "codex_hover": False,
+        "reset_click_targets": [],
+        "reset_click_widgets": [],
+        "reset_hitboxes": [],
+        "reset_hover": False,
         "refresh_hover": False,
         "reset_cards_win": None,
+        "claude_reset_win": None,
         "reset_cards_account": None,
         "reset_cards_busy": False,
         "panel_structure": None,
@@ -5031,9 +5222,9 @@ def run_ui() -> None:
         state["panel_structure"] = None
         state["panel_items"] = []
         state["panel_empty_label"] = None
-        state["codex_click_targets"] = []
-        state["codex_click_widgets"] = []
-        state["codex_hitboxes"] = []
+        state["reset_click_targets"] = []
+        state["reset_click_widgets"] = []
+        state["reset_hitboxes"] = []
         # Grid weights survive child destruction. Reset them before switching
         # between the compact strip and the auxiliary-panel instrument grid.
         try:
@@ -5044,8 +5235,8 @@ def run_ui() -> None:
             pass
 
     def bind_hover_tracking(widget: tk.Misc) -> None:
-        widget.bind("<Motion>", track_codex_hover, add="+")
-        widget.bind("<Leave>", lambda _event: set_codex_hover(False), add="+")
+        widget.bind("<Motion>", track_reset_hover, add="+")
+        widget.bind("<Leave>", lambda _event: set_reset_hover(False), add="+")
 
     def bind_drag(widget: tk.Misc) -> None:
         widget.bind("<ButtonPress-1>", start_move)
@@ -5093,53 +5284,58 @@ def run_ui() -> None:
             return False
         return _point_in_box(point[0], point[1], state.get("refresh_hitbox"))
 
-    def codex_account_at_event(event: tk.Event) -> str | None:
-        """Which Codex account's usage number sits under the pointer, if any."""
+    def reset_target_at_event(event: tk.Event) -> str | None:
+        """Which provider's usage number sits under the pointer, if any.
+
+        Returns a Codex account id or "claude"; the caller opens whichever
+        reset UI that provider has.
+        """
         point = _event_local_point(event)
         if point is None:
             return None
-        for box, provider_id in state.get("codex_hitboxes") or []:
+        for box, provider_id in state.get("reset_hitboxes") or []:
             if _point_in_box(point[0], point[1], box):
                 return provider_id
         return None
 
-    def register_codex_click_targets(targets: list[tuple[tk.Misc, str]]) -> None:
-        """Track each Codex percentage label with the account it belongs to.
+    def register_reset_click_targets(targets: list[tuple[tk.Misc, str]]) -> None:
+        """Track each clickable percentage label with the provider it belongs to.
 
         The rows are rendered exactly as before; this only remembers which
         labels are live. Transparent padding and the plate layer swallow direct
         widget events, so hover and click are resolved from window-relative
         boxes the same way the refresh control is. Carrying the provider id
         next to each box is what stops a click on one account's number from
-        redeeming the other account's card.
+        redeeming the other account's card, and keeps Claude's row pointed at
+        its own dialog.
         """
-        state["codex_click_targets"] = targets
-        state["codex_click_widgets"] = [widget for widget, _ in targets]
-        state["codex_hitboxes"] = []
-        state["codex_hover"] = False
+        state["reset_click_targets"] = targets
+        state["reset_click_widgets"] = [widget for widget, _ in targets]
+        state["reset_hitboxes"] = []
+        state["reset_hover"] = False
         for widget, _provider_id in targets:
             try:
                 # Remember the rendered colour so hover can hand it back
                 # untouched instead of recomputing the tone.
                 setattr(widget, "_usage_rest_fg", widget.cget("fg"))
                 widget.configure(cursor="hand2")
-                widget.bind("<Enter>", lambda _event: set_codex_hover(True), add="+")
-                widget.bind("<Leave>", lambda _event: set_codex_hover(False), add="+")
+                widget.bind("<Enter>", lambda _event: set_reset_hover(True), add="+")
+                widget.bind("<Leave>", lambda _event: set_reset_hover(False), add="+")
             except Exception:
                 pass
-        root.after_idle(update_codex_hitboxes)
+        root.after_idle(update_reset_hitboxes)
 
-    def set_codex_hover(hovering: bool) -> None:
+    def set_reset_hover(hovering: bool) -> None:
         hovering = bool(hovering)
-        if bool(state.get("codex_hover")) == hovering:
+        if bool(state.get("reset_hover")) == hovering:
             return
-        state["codex_hover"] = hovering
+        state["reset_hover"] = hovering
         if state.get("panel_active"):
             # Same trade-off as the refresh control: repainting a full-screen
             # layered surface for a hover tint is not worth it, and the hand
             # cursor already communicates the click.
             return
-        for widget in state.get("codex_click_widgets") or []:
+        for widget in state.get("reset_click_widgets") or []:
             try:
                 if not widget.winfo_exists():
                     continue
@@ -5149,10 +5345,10 @@ def run_ui() -> None:
                 pass
         update_plate_cursor()
 
-    def update_codex_hitboxes(attempt: int = 0) -> None:
+    def update_reset_hitboxes(attempt: int = 0) -> None:
         boxes: list[tuple[tuple[int, int, int, int], str]] = []
         unmapped = False
-        for widget, provider_id in state.get("codex_click_targets") or []:
+        for widget, provider_id in state.get("reset_click_targets") or []:
             try:
                 if not widget.winfo_exists():
                     continue
@@ -5171,15 +5367,15 @@ def run_ui() -> None:
             except Exception:
                 continue
         if unmapped and attempt < 8:
-            root.after(60, lambda: update_codex_hitboxes(attempt + 1))
+            root.after(60, lambda: update_reset_hitboxes(attempt + 1))
             if not boxes:
                 return
-        state["codex_hitboxes"] = boxes
+        state["reset_hitboxes"] = boxes
 
     def update_plate_cursor() -> None:
         if bg_layer is None or state.get("panel_active"):
             return
-        hot = bool(state.get("refresh_hover") or state.get("codex_hover"))
+        hot = bool(state.get("refresh_hover") or state.get("reset_hover"))
         try:
             bg_layer.configure(cursor="hand2" if hot else "")
         except Exception:
@@ -5200,17 +5396,24 @@ def run_ui() -> None:
         state["refresh_hover"] = bool(hovering)
         update_plate_cursor()
 
-    def track_codex_hover(event: tk.Event) -> None:
-        set_codex_hover(codex_account_at_event(event) is not None)
+    def track_reset_hover(event: tk.Event) -> None:
+        set_reset_hover(reset_target_at_event(event) is not None)
+
+    def open_reset_ui(provider_id: str) -> None:
+        """Send the click to whichever reset UI this provider has."""
+        if provider_id == "claude":
+            open_claude_reset_info()
+        elif provider_id in CODEX_ACCOUNT_BY_ID:
+            open_codex_reset_cards(provider_id)
 
     def stop_move(event: tk.Event) -> None:
         if state.get("panel_active"):
             if event_hits_refresh(event) and not state["refreshing"]:
                 refresh_async(force=True)
             else:
-                provider_id = codex_account_at_event(event)
+                provider_id = reset_target_at_event(event)
                 if provider_id:
-                    open_codex_reset_cards(provider_id)
+                    open_reset_ui(provider_id)
         elif state["dragging"]:
             cfg["x"] = root.winfo_x()
             cfg["y"] = root.winfo_y()
@@ -5220,9 +5423,9 @@ def run_ui() -> None:
         elif event_hits_refresh(event) and not state["refreshing"]:
             refresh_async(force=True)
         else:
-            provider_id = codex_account_at_event(event)
+            provider_id = reset_target_at_event(event)
             if provider_id:
-                open_codex_reset_cards(provider_id)
+                open_reset_ui(provider_id)
 
     def _right_text(dr: DisplayRow) -> tuple[str, str, str | None]:
         """Return (pct_text, time_text, fail_or_summary) for right side."""
@@ -5231,6 +5434,10 @@ def run_ui() -> None:
         if dr.used_pct is not None:
             rem = format_remaining(dr.resets_at)
             pct_text = dr.summary or f"{dr.used_pct:.0f}%"
+            if dr.reset_available:
+                # Only marks a row that has an unused reset waiting; rows
+                # without one render byte-for-byte as before.
+                pct_text = f"{pct_text}{RESET_AVAILABLE_MARK}"
             return pct_text, rem, None
         if dr.summary:
             return "", "", dr.summary
@@ -5391,7 +5598,7 @@ def run_ui() -> None:
 
         half_gap = max(4, metrics.cell_gap // 2)
         panel_items: list[dict[str, Any]] = []
-        codex_targets: list[tuple[tk.Misc, str]] = []
+        reset_targets: list[tuple[tk.Misc, str]] = []
         for index, (dr, presentation) in enumerate(zip(rows, presentations)):
             # Column-major placement keeps Claude's related windows together.
             column = min(columns - 1, index // grid_rows)
@@ -5466,8 +5673,8 @@ def run_ui() -> None:
                 pady=(2, 7),
             )
 
-            if pct_text and dr.provider_id in CODEX_ACCOUNT_BY_ID:
-                codex_targets.append((value_label, dr.provider_id))
+            if pct_text and row_opens_reset_ui(dr):
+                reset_targets.append((value_label, dr.provider_id))
 
             if pct_text:
                 bar = tk.Canvas(
@@ -5512,7 +5719,7 @@ def run_ui() -> None:
         bind_drag(body)
         state["panel_structure"] = structure
         state["panel_items"] = panel_items
-        register_codex_click_targets(codex_targets)
+        register_reset_click_targets(reset_targets)
 
     def render_lines() -> None:
         providers: list[ProviderUsage] = state["providers"]
@@ -5539,7 +5746,7 @@ def run_ui() -> None:
             bind_drag(row)
             return
 
-        codex_targets: list[tuple[tk.Misc, str]] = []
+        reset_targets: list[tuple[tk.Misc, str]] = []
         for dr in iter_display_rows(providers):
             # pack order: right first (natural width, never clipped), then left expands
             row = tk.Frame(lines_frame, bg=ui_bg, height=row_h)
@@ -5596,8 +5803,8 @@ def run_ui() -> None:
                 )
                 pct_lbl.pack(side="right", padx=(0, 4))
                 bind_drag(pct_lbl)
-                if pct_t and dr.provider_id in CODEX_ACCOUNT_BY_ID:
-                    codex_targets.append((pct_lbl, dr.provider_id))
+                if pct_t and row_opens_reset_ui(dr):
+                    reset_targets.append((pct_lbl, dr.provider_id))
 
             left = tk.Label(
                 row,
@@ -5634,7 +5841,7 @@ def run_ui() -> None:
 
         bind_drag(lines_frame)
         bind_drag(body)
-        register_codex_click_targets(codex_targets)
+        register_reset_click_targets(reset_targets)
 
     def render_footer() -> None:
         def on_refresh() -> None:
@@ -7656,6 +7863,210 @@ def run_ui() -> None:
         win.lift()
         win.focus_set()
 
+    def open_claude_reset_info() -> None:
+        """Show Claude's weekly /limit-reset entitlement.
+
+        Read-only on purpose: Anthropic exposes the status on the usage
+        endpoint, but the redeem call lives in a lazily-loaded CLI chunk and is
+        not documented, so the HUD reports what is available and points at the
+        command that spends it rather than guessing at an endpoint.
+        """
+        existing = state.get("claude_reset_win")
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    place_settings_on_primary(existing)
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_set()
+                    return
+            except Exception:
+                pass
+
+        win = tk.Toplevel(root)
+        # Same reason as the settings dialog: map once, at the final position.
+        win.withdraw()
+        state["claude_reset_win"] = win
+        win.title("claude 用量重置")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+
+        dialog_font = tkfont.Font(family=font_family, size=10)
+        dialog_font_small = tkfont.Font(family=font_family, size=9)
+        setattr(win, "_usage_float_fonts", (dialog_font, dialog_font_small))
+
+        shell = tk.Frame(win, bg=BG, padx=14, pady=12)
+        shell.pack(fill="both", expand=True)
+
+        headline = tk.Label(
+            shell,
+            text="",
+            fg=FG,
+            bg=BG,
+            font=dialog_font,
+            anchor="w",
+            justify="left",
+            wraplength=380,
+        )
+        headline.pack(fill="x")
+
+        detail_frame = tk.Frame(shell, bg=BG, width=380)
+        detail_frame.pack(fill="both", expand=True, pady=(8, 6))
+
+        status_label = tk.Label(
+            shell,
+            text="",
+            fg=FG_MUTED,
+            bg=BG,
+            font=dialog_font_small,
+            anchor="w",
+            justify="left",
+            wraplength=380,
+        )
+        status_label.pack(fill="x")
+
+        btn_row = tk.Frame(shell, bg=BG)
+        btn_row.pack(fill="x", pady=(10, 0))
+
+        def alive() -> bool:
+            try:
+                return bool(win.winfo_exists())
+            except Exception:
+                return False
+
+        def close() -> None:
+            state["claude_reset_win"] = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def add_detail(text: str, *, muted: bool = False) -> None:
+            tk.Label(
+                detail_frame,
+                text=text,
+                fg=FG_MUTED if muted else FG,
+                bg=BG,
+                font=dialog_font,
+                anchor="w",
+                justify="left",
+                wraplength=380,
+            ).pack(fill="x", pady=1)
+
+        def claude_provider() -> ProviderUsage | None:
+            for provider in state.get("providers") or []:
+                if provider.provider_id == "claude":
+                    return provider
+            return None
+
+        def render() -> None:
+            if not alive():
+                return
+            for widget in list(detail_frame.winfo_children()):
+                try:
+                    widget.destroy()
+                except Exception:
+                    pass
+
+            provider = claude_provider()
+            if provider is None or provider.reset_block is None:
+                headline.configure(text="还没有读到 claude 的重置额度。")
+                add_detail(
+                    "刷新一次用量即可；若一直读不到，多半是 Claude Code 未登录或版本过旧。",
+                    muted=True,
+                )
+                status_label.configure(text="", fg=FG_MUTED)
+                place_settings_on_primary(win)
+                return
+
+            reset = claude_reset_status(provider)
+            if reset.available:
+                headline.configure(text=f"有 {reset.resets_left} 次可用的用量重置。")
+                if reset.label:
+                    add_detail(reset.label, muted=True)
+                remaining = format_remaining(reset.expires_at)
+                expires = parse_iso(reset.expires_at)
+                if expires is not None:
+                    if expires.tzinfo is None:
+                        expires = expires.replace(tzinfo=timezone.utc)
+                    suffix = f"（剩余 {remaining}）" if remaining else ""
+                    add_detail(f"有效期至 {expires.astimezone():%Y-%m-%d %H:%M}{suffix}")
+                if reset.clears:
+                    names = "、".join(
+                        CLAUDE_RESET_WINDOW_TEXT.get(window, window)
+                        for window in reset.clears
+                    )
+                    add_detail(f"可重置：{names}")
+                if reset.use_requires_limit and not reset.at_limit:
+                    add_detail("需要先撞到用量上限才能使用。", muted=True)
+                elif reset.usable_now:
+                    add_detail("现在就可以使用。", muted=True)
+            else:
+                headline.configure(text="当前没有可用的用量重置。")
+                if reset.ineligible_reason:
+                    add_detail(
+                        CLAUDE_RESET_REASON_TEXT.get(
+                            reset.ineligible_reason, reset.ineligible_reason
+                        ),
+                        muted=True,
+                    )
+                else:
+                    add_detail("Anthropic 发放后会出现在这里。", muted=True)
+
+            weekly = parse_iso(reset.weekly_resets_at)
+            if weekly is not None:
+                if weekly.tzinfo is None:
+                    weekly = weekly.replace(tzinfo=timezone.utc)
+                add_detail(f"每周重置日：{weekly.astimezone():%Y-%m-%d %H:%M}", muted=True)
+
+            status_label.configure(
+                text=(
+                    "使用方式：在 Claude Code 里运行 /limit-reset。"
+                    "核销接口官方未公开，UsageFloat 只负责显示。"
+                ),
+                fg=FG_MUTED,
+            )
+            place_settings_on_primary(win)
+
+        def reload_now() -> None:
+            if state["refreshing"]:
+                return
+            status_label.configure(text="正在刷新用量…", fg=FG_MUTED)
+            refresh_async(force=True)
+            # apply_data() replaces state["providers"]; re-read once it lands.
+            root.after(2500, render)
+
+        tk.Button(
+            btn_row,
+            text="刷新",
+            command=reload_now,
+            bg="#f0f0f0",
+            fg=FG,
+            relief="flat",
+            padx=12,
+            pady=4,
+            font=dialog_font,
+        ).pack(side="right")
+        tk.Button(
+            btn_row,
+            text="关闭",
+            command=close,
+            bg="#f0f0f0",
+            fg=FG,
+            relief="flat",
+            padx=12,
+            pady=4,
+            font=dialog_font,
+        ).pack(side="left")
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.bind("<Escape>", lambda _event: close())
+        render()
+        place_settings_on_primary(win)
+        win.deiconify()
+        win.lift()
+        win.focus_set()
+
     def open_codex_reset_cards(provider_id: str = "codex") -> None:
         account = CODEX_ACCOUNT_BY_ID.get(provider_id) or CODEX_ACCOUNTS[0]
         existing = state.get("reset_cards_win")
@@ -8382,7 +8793,8 @@ def main(argv: list[str] | None = None) -> int:
             right = row.summary or ""
             if row.used_pct is not None:
                 rem = format_remaining(row.resets_at)
-                right = (row.summary or f"{row.used_pct:.0f}%") + (
+                mark = RESET_AVAILABLE_MARK if row.reset_available else ""
+                right = (row.summary or f"{row.used_pct:.0f}%") + mark + (
                     f"  {rem}" if rem else ""
                 )
             print(f"{row.title}  {right}".rstrip())
