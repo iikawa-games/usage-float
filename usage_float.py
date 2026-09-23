@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -43,7 +44,7 @@ APP_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", HOME / ".claude"))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 CODEX_HOME_2 = Path(os.environ.get("CODEX_HOME_2", HOME / ".codex-2"))
@@ -71,6 +72,13 @@ CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 # entitlement. Its status rides along on the usage endpoint as a query flag,
 # so reading it costs no extra call against an API that answers 429 easily.
 CLAUDE_USAGE_RESET_URL = f"{CLAUDE_USAGE_URL}?cedar_ember=1&skip_spend=1"
+CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+# Redeem call used by the CLI's /limit-reset, keyed by the OAuth organization.
+CLAUDE_RESET_CLAIM_URL = "https://api.anthropic.com/api/organizations/{org}/reset_rate_limits"
+CLAUDE_RESET_PROGRAM = "cedar_ember"
+# The CLI refuses to send ids outside these shapes; so does the HUD.
+CLAUDE_RESET_GRANT_ID_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
+CLAUDE_RESET_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # The server only hands that block to the CLI surface: a plain request comes
 # back with ineligible_reason="surface". Report the version actually installed
 # so the gate reflects this machine instead of a number frozen into the file.
@@ -130,13 +138,21 @@ CODEX_ACCOUNT_BY_ID: dict[str, CodexAccount] = {
     account.provider_id: account for account in CODEX_ACCOUNTS
 }
 
+# Claude is one login but several rows, and each row is ordered and toggled
+# on its own in Settings. Every other provider is a single row under its id.
+CLAUDE_DISPLAY_ITEMS: tuple[str, ...] = ("claude:fable", "claude:7d", "claude:5h")
+CLAUDE_WINDOW_ITEMS: dict[str, str] = {
+    "seven_day": "claude:7d",
+    "five_hour": "claude:5h",
+}
+
 # Display order. A provider only appears when it is actually signed in, so a
 # machine with one Codex account shows one Codex row.
 DEFAULT_PROVIDERS: tuple[str, ...] = (
     "codex",
     "codex-2",
     "grok",
-    "claude",
+    *CLAUDE_DISPLAY_ITEMS,
     "llmproxy",
 )
 PROVIDER_LABELS: dict[str, str] = {
@@ -144,8 +160,16 @@ PROVIDER_LABELS: dict[str, str] = {
     "codex-2": "Codex 2",
     "grok": "Grok",
     "claude": "Claude",
+    "claude:fable": "fable 7d",
+    "claude:7d": "claude 7d",
+    "claude:5h": "claude 5h",
     "llmproxy": "LLM Proxy",
 }
+
+
+def provider_fetch_id(item: str) -> str:
+    """The provider a display item is fetched from ("claude:5h" -> "claude")."""
+    return "claude" if item.startswith("claude:") else item
 
 # SuperGrok / Grok Build credit window (same endpoint CC Switch / CodexBar use).
 # NOT cli-chat-proxy.grok.com/v1/billing — that returns 0/0 for subscription accounts.
@@ -1661,8 +1685,11 @@ def _unique_provider_ids(values: Any) -> list[str]:
     for item in values or []:
         if isinstance(item, str):
             pid = item.strip()
-            if pid and pid not in out:
-                out.append(pid)
+            # Configs from before the per-row split name Claude once; it
+            # stands for all of its rows, in their default order.
+            for expanded in CLAUDE_DISPLAY_ITEMS if pid == "claude" else (pid,):
+                if expanded and expanded not in out:
+                    out.append(expanded)
     return out
 
 
@@ -2360,6 +2387,19 @@ def claude_request_headers(token: str) -> dict[str, str]:
 
 
 @dataclass
+class ClaudeResetGrant:
+    """One /limit-reset grant; the claim call names it by id."""
+
+    grant_id: str
+    resets_left: int = 0
+    expires_at: str | None = None
+    clears: tuple[str, ...] = ()
+    usable_now: bool = False
+    use_requires_limit: bool = False
+    paused: bool = False
+
+
+@dataclass
 class ClaudeResetStatus:
     """Claude's weekly /limit-reset entitlement, as shown by the HUD."""
 
@@ -2377,14 +2417,23 @@ class ClaudeResetStatus:
     # windows it refills.
     label: str | None = None
     clears: tuple[str, ...] = ()
+    # Unspent grants, soonest expiry first. The server only redeems the one
+    # named by next_grant_id and answers "not_next_grant" for any other.
+    grants: tuple[ClaudeResetGrant, ...] = ()
+    next_grant_id: str | None = None
 
     @property
     def available(self) -> bool:
         return self.resets_left > 0
 
+    def claimable(self, grant: ClaudeResetGrant) -> bool:
+        return (
+            grant.grant_id == self.next_grant_id
+            and grant.usable_now
+            and not grant.paused
+            and grant.resets_left > 0
+        )
 
-# Appended to a usage number that an unused reset can refill.
-RESET_AVAILABLE_MARK = "\u21ba"
 
 CLAUDE_RESET_WINDOW_TEXT = {
     "five_hour": "5 小时会话",
@@ -2402,6 +2451,14 @@ CLAUDE_RESET_REASON_TEXT = {
     "no_profile_scope": "登录凭证缺少所需权限",
     "not_authorized": "账号未获授权",
 }
+
+
+def _claude_grant_clears(grant: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        str(window)
+        for window in (_first_present(grant, "clears", "limit_types", "limitTypes") or [])
+        if window
+    )
 
 
 def _claude_grant_int(grant: dict[str, Any], *names: str) -> int:
@@ -2429,8 +2486,12 @@ def parse_claude_reset_status(block: Any) -> ClaudeResetStatus:
         ),
     )
 
+    next_id = _first_present(block, "next_grant_id", "nextGrantId")
+    status.next_grant_id = str(next_id) if next_id else None
+
     total = 0
     soonest_expiry: str | None = None
+    grants: list[ClaudeResetGrant] = []
     for grant in _first_present(block, "grants") or []:
         if not isinstance(grant, dict):
             continue
@@ -2438,6 +2499,20 @@ def parse_claude_reset_status(block: Any) -> ClaudeResetStatus:
         if left <= 0 or _first_present(grant, "paused"):
             continue
         total += left
+        grant_id = _first_present(grant, "id", "grant_id", "grantId")
+        if grant_id:
+            grants.append(
+                ClaudeResetGrant(
+                    grant_id=str(grant_id),
+                    resets_left=left,
+                    expires_at=_iso_timestamp(_first_present(grant, "ends_at", "endsAt")),
+                    clears=_claude_grant_clears(grant),
+                    usable_now=bool(_first_present(grant, "usable_now", "usableNow")),
+                    use_requires_limit=bool(
+                        _first_present(grant, "use_requires_limit", "useRequiresLimit")
+                    ),
+                )
+            )
         if _first_present(grant, "usable_now", "usableNow"):
             status.usable_now = True
         if _first_present(grant, "use_requires_limit", "useRequiresLimit"):
@@ -2453,17 +2528,19 @@ def parse_claude_reset_status(block: Any) -> ClaudeResetStatus:
         soonest_expiry = ends_at or soonest_expiry
         label = _first_present(grant, "label", "title", "name")
         status.label = str(label).strip() if label else None
-        status.clears = tuple(
-            str(window)
-            for window in (_first_present(grant, "clears", "limit_types", "limitTypes") or [])
-            if window
-        )
+        status.clears = _claude_grant_clears(grant)
 
     # Some responses only carry the rolled-up count, with no per-grant rows.
     status.resets_left = total or _claude_grant_int(
         block, "resets_left_total", "resetsLeftTotal", "resets_left"
     )
     status.expires_at = soonest_expiry
+    status.grants = tuple(
+        sorted(
+            grants,
+            key=lambda g: (_iso_epoch(g.expires_at, float("inf")), g.grant_id),
+        )
+    )
     return status
 
 
@@ -2471,6 +2548,134 @@ def claude_reset_status(provider: ProviderUsage | None) -> ClaudeResetStatus:
     if provider is None:
         return ClaudeResetStatus()
     return parse_claude_reset_status(provider.reset_block)
+
+
+def claude_authorized_json(
+    url: str,
+    *,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    timeout: float = 20.0,
+) -> tuple[int, Any]:
+    """Call an Anthropic OAuth endpoint, refreshing the token once on 401/403.
+
+    Returns status 0 when there are no local credentials at all.
+    """
+    oauth, cred_path = read_claude_oauth()
+    if not oauth:
+        return 0, None
+
+    def call(token: str) -> tuple[int, Any]:
+        return http_json(
+            url,
+            method=method,
+            headers=claude_request_headers(token),
+            body=body,
+            timeout=timeout,
+        )
+
+    status, payload = call(oauth["accessToken"])
+    if status not in (401, 403):
+        return status, payload
+    rt = oauth.get("refreshToken")
+    if not rt or not cred_path:
+        return status, payload
+    refreshed = refresh_claude_token(rt)
+    if not refreshed or not refreshed.get("access_token"):
+        return status, payload
+    oauth["accessToken"] = refreshed["access_token"]
+    if refreshed.get("refresh_token"):
+        oauth["refreshToken"] = refreshed["refresh_token"]
+    save_claude_oauth(cred_path, oauth)
+    return call(oauth["accessToken"])
+
+
+def claude_organization_uuid() -> str | None:
+    """The OAuth organization the claim is filed under.
+
+    Claude Code records it in .claude.json at login; the profile endpoint is
+    the fallback when that file is somewhere unexpected.
+    """
+    for path in (CLAUDE_HOME / ".claude.json", HOME / ".claude.json"):
+        try:
+            if not path.exists():
+                continue
+            data = json.loads(path.read_text(encoding="utf-8"))
+            found = str(((data or {}).get("oauthAccount") or {}).get("organizationUuid") or "")
+            if found.strip():
+                return found.strip()
+        except Exception:
+            continue
+    status, payload = claude_authorized_json(CLAUDE_PROFILE_URL)
+    if status == 200 and isinstance(payload, dict):
+        found = str((payload.get("organization") or {}).get("uuid") or "").strip()
+        if found:
+            return found
+    return None
+
+
+@dataclass
+class ClaudeResetClaim:
+    ok: bool
+    message: str
+    # False when the outcome is unknown (network drop, 5xx): the next attempt
+    # must resend the same request_id so the server can dedupe it instead of
+    # spending a second reset.
+    settled: bool = True
+
+
+CLAUDE_RESET_RESULT_TEXT = {
+    "already_used": "这次重置已经用过了。",
+    "not_limited": "还没到用量上限，暂时不能使用，额度未消耗。",
+    "cooldown": "刚用过一次重置，冷却中，稍后再试。",
+    "ineligible": "当前账号不符合使用条件。",
+    "unavailable": "重置暂不可用，稍后再试。",
+}
+
+
+def claim_claude_reset(grant_id: str, *, request_id: str) -> ClaudeResetClaim:
+    """Spend one /limit-reset grant. Only call this after the user confirms."""
+    if not CLAUDE_RESET_GRANT_ID_RE.match(grant_id or "") or not (
+        CLAUDE_RESET_REQUEST_ID_RE.match(request_id or "")
+    ):
+        return ClaudeResetClaim(False, "重置数据格式异常，未发送请求。")
+    org = claude_organization_uuid()
+    if not org:
+        return ClaudeResetClaim(False, "找不到 Claude 组织信息，请在 Claude Code 里重新登录。")
+    status, payload = claude_authorized_json(
+        CLAUDE_RESET_CLAIM_URL.format(org=urllib.parse.quote(org, safe="")),
+        method="POST",
+        body={
+            "program": CLAUDE_RESET_PROGRAM,
+            "grant_id": grant_id,
+            "request_id": request_id,
+        },
+        timeout=25.0,
+    )
+    if status == 0 and payload is None:
+        return ClaudeResetClaim(False, "未找到可用的 Claude 登录凭证")
+    if status == 200 and isinstance(payload, dict):
+        result = str(payload.get("result") or "unavailable")
+        if result == "reset":
+            cleared = "、".join(
+                CLAUDE_RESET_WINDOW_TEXT.get(str(w), str(w))
+                for w in payload.get("cleared") or []
+            )
+            message = f"已重置{cleared}。" if cleared else "用量已重置。"
+            left = payload.get("resets_left")
+            if isinstance(left, int):
+                message += f" 剩余 {left} 次。"
+            return ClaudeResetClaim(True, message)
+        return ClaudeResetClaim(
+            False, CLAUDE_RESET_RESULT_TEXT.get(result, CLAUDE_RESET_RESULT_TEXT["unavailable"])
+        )
+    if status == 429:
+        return ClaudeResetClaim(False, "请求太频繁，稍后再试。", settled=False)
+    if status in (401, 403):
+        return ClaudeResetClaim(False, "Claude 登录已失效，请在 Claude Code 里重新登录。")
+    return ClaudeResetClaim(
+        False, f"使用失败：{codex_error_text(status, payload)}", settled=False
+    )
 
 
 def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
@@ -2483,7 +2688,7 @@ def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
             stale=True,
         )
 
-    oauth, cred_path = read_claude_oauth()
+    oauth, _cred_path = read_claude_oauth()
     if not oauth:
         return ProviderUsage(
             provider_id="claude",
@@ -2493,37 +2698,7 @@ def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
         )
 
     plan = oauth.get("subscriptionType")
-    access = oauth["accessToken"]
-
-    def call(token: str) -> tuple[int, Any]:
-        return http_json(
-            CLAUDE_USAGE_RESET_URL,
-            headers=claude_request_headers(token),
-        )
-
-    status, payload = call(access)
-    if status in (401, 403):
-        rt = oauth.get("refreshToken")
-        if not rt or not cred_path:
-            return ProviderUsage(
-                provider_id="claude",
-                display_name="claude",
-                available=False,
-                error="更新失败",
-            )
-        refreshed = refresh_claude_token(rt)
-        if not refreshed or not refreshed.get("access_token"):
-            return ProviderUsage(
-                provider_id="claude",
-                display_name="claude",
-                available=False,
-                error="更新失败",
-            )
-        oauth["accessToken"] = refreshed["access_token"]
-        if refreshed.get("refresh_token"):
-            oauth["refreshToken"] = refreshed["refresh_token"]
-        save_claude_oauth(cred_path, oauth)
-        status, payload = call(oauth["accessToken"])
+    status, payload = claude_authorized_json(CLAUDE_USAGE_RESET_URL)
 
     if status == 429:
         set_claude_backoff()
@@ -2545,12 +2720,8 @@ def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
 
     windows: list[UsageWindow] = []
     five = payload.get("five_hour") or {}
-    # Rows read "fable 7d → claude 5h". The account-wide seven_day window is
-    # deliberately not shown — it resets on the same clock as the model-scoped
-    # weekly row, so two 7d numbers competed for one glance. Note the scoped row
-    # is not a strict upper bound on it: weekly_all counts every model against
-    # its own limit, so it can lead if usage shifts off Fable. To bring it back,
-    # append payload["seven_day"] here.
+    # Rows read "fable 7d → claude 7d → claude 5h"; Settings decides which of
+    # them show and in what order.
     #
     # Model-scoped weekly limits (e.g. Fable)
     for entry in payload.get("limits") or []:
@@ -2577,6 +2748,17 @@ def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
                 label=f"{model_key} 7d",
                 used_pct=pct_f,
                 resets_at=entry.get("resets_at"),
+            )
+        )
+
+    week = payload.get("seven_day") or {}
+    if isinstance(week, dict) and week.get("utilization") is not None:
+        windows.append(
+            UsageWindow(
+                id="seven_day",
+                label="7d",
+                used_pct=float(week["utilization"]),
+                resets_at=week.get("resets_at"),
             )
         )
 
@@ -3621,6 +3803,7 @@ def provider_available(provider_id: str) -> bool:
     A provider that is not signed in is hidden outright rather than drawn as a
     failed row, so an unused slot never occupies space in the strip.
     """
+    provider_id = provider_fetch_id(provider_id)
     account = CODEX_ACCOUNT_BY_ID.get(provider_id)
     if account is not None:
         return read_codex_auth(account.home)[0] is not None
@@ -3640,6 +3823,8 @@ def active_providers(configured: list[str] | None = None) -> list[str]:
 
 
 def fetch_all(providers: list[str], *, force: bool = False) -> list[ProviderUsage]:
+    """Fetch each provider once, however many display items it backs."""
+    providers = list(dict.fromkeys(provider_fetch_id(item) for item in providers))
     out: list[ProviderUsage] = []
     for p in providers:
         try:
@@ -3681,8 +3866,6 @@ class DisplayRow:
     failed: bool = False
     provider_id: str = ""
     window_id: str = ""
-    # Claude only: this window can be refilled by an unused /limit-reset grant.
-    reset_available: bool = False
 
 
 def row_opens_reset_ui(row: DisplayRow) -> bool:
@@ -3696,12 +3879,51 @@ def row_opens_reset_ui(row: DisplayRow) -> bool:
     return row.provider_id == "claude" and row.window_id == "five_hour"
 
 
-def iter_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
+def display_item(row: DisplayRow) -> str | None:
+    """The Settings entry that shows or hides this row.
+
+    None for a Claude row that is not tied to one window (a failure line).
+    """
+    if row.provider_id != "claude":
+        return row.provider_id
+    if row.window_id.startswith("weekly_"):
+        return "claude:fable"
+    return CLAUDE_WINDOW_ITEMS.get(row.window_id)
+
+
+def iter_display_rows(
+    providers: list[ProviderUsage],
+    items: list[str] | None = None,
+) -> list[DisplayRow]:
     """Expand providers into fixed rows.
 
     Claude (and any multi-window model) becomes one row per time window so the
     strip width stays stable instead of growing when 5h+7d are concatenated.
+    With ``items`` (the enabled Settings entries, in order) rows are filtered
+    and sorted by them; a Claude failure line sits where its first row would.
     """
+    rows = _expand_display_rows(providers)
+    if items is None:
+        return rows
+    rank = {item: index for index, item in enumerate(_unique_provider_ids(items))}
+    claude_ranks = [rank[item] for item in CLAUDE_DISPLAY_ITEMS if item in rank]
+    ranked: list[tuple[int, DisplayRow]] = []
+    for row in rows:
+        item = display_item(row)
+        if item is None:
+            if not claude_ranks:
+                continue
+            position = min(claude_ranks)
+        elif item in rank:
+            position = rank[item]
+        else:
+            continue
+        ranked.append((position, row))
+    ranked.sort(key=lambda pair: pair[0])
+    return [row for _position, row in ranked]
+
+
+def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
     rows: list[DisplayRow] = []
     for p in providers:
         name = (p.display_name or p.provider_id).lower()
@@ -3729,8 +3951,6 @@ def iter_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
 
         if p.windows:
             multi = len(p.windows) > 1
-            reset = claude_reset_status(p) if p.provider_id == "claude" else None
-            refillable = set(reset.clears) if reset and reset.available else set()
             # Allow 5h + 7d + scoped model weeks (e.g. fable 7d)
             for w in p.windows[:5]:
                 # "claude 5h" / "claude 7d" / "fable 7d" (scoped rows omit provider prefix)
@@ -3748,7 +3968,6 @@ def iter_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                         summary=p.summary if not multi else None,
                         provider_id=p.provider_id,
                         window_id=w.id,
-                        reset_available=w.id in refillable,
                     )
                 )
             continue
@@ -4032,6 +4251,10 @@ def _tk_geometry(width: int, height: int, x: int, y: int) -> str:
     return f"{width}x{height}{_tk_position(x, y)}"
 
 
+# Height, at 96 DPI, that one row of the tuned panel type needs incl. gaps.
+PANEL_TUNED_ROW_PX = 200
+
+
 def _panel_grid_shape(row_count: int, width: int, height: int) -> tuple[int, int]:
     count = max(1, int(row_count))
     columns = 2 if count >= 4 and width >= int(height * 1.15) else 1
@@ -4048,6 +4271,11 @@ def _panel_metrics(
     columns, rows = _panel_grid_shape(row_count, width, height)
     dpi = max(72, int(dpi or 96))
     cell_height = max(72, int((height - max(48, height * 0.10)) / rows))
+    # The type sizes below were tuned for three rows on a 640 px-tall panel.
+    # Beyond the rows that height holds, shrink them together so extra rows
+    # (e.g. Claude split into three) stay on screen instead of being clipped.
+    fit_rows = max(1, int(height / (PANEL_TUNED_ROW_PX * dpi / 96)))
+    scale = min(1.0, fit_rows / rows)
 
     def points(px: float, low: int, high: int) -> int:
         return max(low, min(high, int(round(px * 72 / dpi))))
@@ -4058,9 +4286,9 @@ def _panel_metrics(
         outer_padding=max(16, min(36, int(round(min(width, height) * 0.035)))),
         cell_gap=max(10, min(24, int(round(min(width, height) * 0.022)))),
         # Fixed, user-tuned hierarchy for the dedicated low-resolution panel.
-        title_points=28,
-        value_points=48,
-        meta_points=24,
+        title_points=max(12, int(round(28 * scale))),
+        value_points=max(18, int(round(48 * scale))),
+        meta_points=max(10, int(round(24 * scale))),
         footer_points=20,
         bar_height=max(6, min(10, int(round(cell_height * 0.045)))),
     )
@@ -4552,6 +4780,9 @@ def run_ui() -> None:
         "refresh_hover": False,
         "reset_cards_win": None,
         "claude_reset_win": None,
+        "claude_reset_busy": False,
+        # (grant_id, request_id) of a claim whose outcome never arrived.
+        "claude_reset_unsettled": None,
         "reset_cards_account": None,
         "reset_cards_busy": False,
         "panel_structure": None,
@@ -5229,8 +5460,10 @@ def run_ui() -> None:
         # between the compact strip and the auxiliary-panel instrument grid.
         try:
             for index in range(12):
-                lines_frame.grid_rowconfigure(index, weight=0, minsize=0)
-                lines_frame.grid_columnconfigure(index, weight=0, minsize=0)
+                # uniform too: an emptied row left in the uniform group still
+                # takes an equal share, squeezing the grid when rows drop.
+                lines_frame.grid_rowconfigure(index, weight=0, minsize=0, uniform="")
+                lines_frame.grid_columnconfigure(index, weight=0, minsize=0, uniform="")
         except Exception:
             pass
 
@@ -5427,6 +5660,9 @@ def run_ui() -> None:
             if provider_id:
                 open_reset_ui(provider_id)
 
+    def shown_items() -> list[str]:
+        return list(cfg.get("providers") or DEFAULT_PROVIDERS)
+
     def _right_text(dr: DisplayRow) -> tuple[str, str, str | None]:
         """Return (pct_text, time_text, fail_or_summary) for right side."""
         if dr.failed:
@@ -5434,10 +5670,6 @@ def run_ui() -> None:
         if dr.used_pct is not None:
             rem = format_remaining(dr.resets_at)
             pct_text = dr.summary or f"{dr.used_pct:.0f}%"
-            if dr.reset_available:
-                # Only marks a row that has an unused reset waiting; rows
-                # without one render byte-for-byte as before.
-                pct_text = f"{pct_text}{RESET_AVAILABLE_MARK}"
             return pct_text, rem, None
         if dr.summary:
             return "", "", dr.summary
@@ -5494,7 +5726,7 @@ def run_ui() -> None:
         panel: MonitorInfo | None = state.get("panel_monitor")
         width = panel.width if panel is not None else max(640, root.winfo_width())
         height = panel.height if panel is not None else max(480, root.winfo_height())
-        rows = iter_display_rows(providers) if providers else []
+        rows = iter_display_rows(providers, shown_items()) if providers else []
         metrics = _panel_metrics(
             width,
             height,
@@ -5747,7 +5979,7 @@ def run_ui() -> None:
             return
 
         reset_targets: list[tuple[tk.Misc, str]] = []
-        for dr in iter_display_rows(providers):
+        for dr in iter_display_rows(providers, shown_items()):
             # pack order: right first (natural width, never clipped), then left expands
             row = tk.Frame(lines_frame, bg=ui_bg, height=row_h)
             row.pack(fill="x", anchor="w", pady=0)
@@ -5926,7 +6158,9 @@ def run_ui() -> None:
         """
         n = max(
             1,
-            len(iter_display_rows(state["providers"])) if state["providers"] else 1,
+            len(iter_display_rows(state["providers"], shown_items()))
+            if state["providers"]
+            else 1,
         )
         rh = int(state["row_height"])
         try:
@@ -7864,13 +8098,7 @@ def run_ui() -> None:
         win.focus_set()
 
     def open_claude_reset_info() -> None:
-        """Show Claude's weekly /limit-reset entitlement.
-
-        Read-only on purpose: Anthropic exposes the status on the usage
-        endpoint, but the redeem call lives in a lazily-loaded CLI chunk and is
-        not documented, so the HUD reports what is available and points at the
-        command that spends it rather than guessing at an endpoint.
-        """
+        """Claude's /limit-reset grants, laid out like the Codex card dialog."""
         existing = state.get("claude_reset_win")
         if existing is not None:
             try:
@@ -7887,6 +8115,7 @@ def run_ui() -> None:
         # Same reason as the settings dialog: map once, at the final position.
         win.withdraw()
         state["claude_reset_win"] = win
+        state["claude_reset_busy"] = False
         win.title("claude 用量重置")
         win.configure(bg=BG)
         win.resizable(False, False)
@@ -7898,20 +8127,18 @@ def run_ui() -> None:
         shell = tk.Frame(win, bg=BG, padx=14, pady=12)
         shell.pack(fill="both", expand=True)
 
-        headline = tk.Label(
+        tk.Label(
             shell,
-            text="",
+            text="选择一次重置，立即重置 claude 的用量窗口。",
             fg=FG,
             bg=BG,
             font=dialog_font,
             anchor="w",
             justify="left",
-            wraplength=380,
-        )
-        headline.pack(fill="x")
+        ).pack(fill="x")
 
-        detail_frame = tk.Frame(shell, bg=BG, width=380)
-        detail_frame.pack(fill="both", expand=True, pady=(8, 6))
+        list_frame = tk.Frame(shell, bg=BG, width=360)
+        list_frame.pack(fill="both", expand=True, pady=(10, 6))
 
         status_label = tk.Label(
             shell,
@@ -7921,12 +8148,16 @@ def run_ui() -> None:
             font=dialog_font_small,
             anchor="w",
             justify="left",
-            wraplength=380,
+            wraplength=360,
         )
         status_label.pack(fill="x")
 
         btn_row = tk.Frame(shell, bg=BG)
         btn_row.pack(fill="x", pady=(10, 0))
+
+        selected_grant = tk.StringVar(value="")
+        grants_by_id: dict[str, ClaudeResetGrant] = {}
+        pending_note = {"text": ""}
 
         def alive() -> bool:
             try:
@@ -7936,22 +8167,48 @@ def run_ui() -> None:
 
         def close() -> None:
             state["claude_reset_win"] = None
+            state["claude_reset_busy"] = False
             try:
                 win.destroy()
             except Exception:
                 pass
 
-        def add_detail(text: str, *, muted: bool = False) -> None:
-            tk.Label(
-                detail_frame,
-                text=text,
-                fg=FG_MUTED if muted else FG,
-                bg=BG,
-                font=dialog_font,
-                anchor="w",
-                justify="left",
-                wraplength=380,
-            ).pack(fill="x", pady=1)
+        def sync_buttons() -> None:
+            if not alive():
+                return
+            busy = bool(state.get("claude_reset_busy"))
+            try:
+                use_btn.configure(
+                    state="disabled" if busy or not selected_grant.get() else "normal"
+                )
+                reload_btn.configure(state="disabled" if busy else "normal")
+            except Exception:
+                pass
+
+        def window_names(windows: tuple[str, ...]) -> str:
+            return "、".join(CLAUDE_RESET_WINDOW_TEXT.get(w, w) for w in windows)
+
+        def describe(grant: ClaudeResetGrant, reset: ClaudeResetStatus) -> str:
+            parts: list[str] = []
+            remaining = format_remaining(grant.expires_at)
+            if remaining == "soon":
+                parts.append("即将过期")
+            elif remaining:
+                parts.append(f"{remaining} 后过期")
+            elif grant.expires_at is None:
+                parts.append("长期有效")
+            if grant.resets_left > 1:
+                parts.append(f"{grant.resets_left} 次")
+            if grant.clears:
+                parts.append(f"重置{window_names(grant.clears)}")
+            if not reset.claimable(grant):
+                if grant.grant_id != reset.next_grant_id:
+                    parts.append("排队中")
+                elif grant.use_requires_limit:
+                    parts.append("到达上限后可用")
+                else:
+                    parts.append("暂不可用")
+            return " · ".join(parts) or grant.grant_id
 
         def claude_provider() -> ProviderUsage | None:
             for provider in state.get("providers") or []:
@@ -7959,94 +8216,185 @@ def run_ui() -> None:
                     return provider
             return None
 
-        def render() -> None:
+        def render_grants(provider: ProviderUsage | None, error: str | None) -> None:
             if not alive():
                 return
-            for widget in list(detail_frame.winfo_children()):
+            for widget in list(list_frame.winfo_children()):
                 try:
                     widget.destroy()
                 except Exception:
                     pass
+            grants_by_id.clear()
+            selected_grant.set("")
+            note = pending_note["text"]
+            pending_note["text"] = ""
 
-            provider = claude_provider()
-            if provider is None or provider.reset_block is None:
-                headline.configure(text="还没有读到 claude 的重置额度。")
-                add_detail(
-                    "刷新一次用量即可；若一直读不到，多半是 Claude Code 未登录或版本过旧。",
-                    muted=True,
-                )
-                status_label.configure(text="", fg=FG_MUTED)
+            if error:
+                status_label.configure(text=error, fg=RED)
+                sync_buttons()
                 place_settings_on_primary(win)
                 return
 
             reset = claude_reset_status(provider)
-            if reset.available:
-                headline.configure(text=f"有 {reset.resets_left} 次可用的用量重置。")
-                if reset.label:
-                    add_detail(reset.label, muted=True)
-                remaining = format_remaining(reset.expires_at)
-                expires = parse_iso(reset.expires_at)
-                if expires is not None:
-                    if expires.tzinfo is None:
-                        expires = expires.replace(tzinfo=timezone.utc)
-                    suffix = f"（剩余 {remaining}）" if remaining else ""
-                    add_detail(f"有效期至 {expires.astimezone():%Y-%m-%d %H:%M}{suffix}")
-                if reset.clears:
-                    names = "、".join(
-                        CLAUDE_RESET_WINDOW_TEXT.get(window, window)
-                        for window in reset.clears
-                    )
-                    add_detail(f"可重置：{names}")
-                if reset.use_requires_limit and not reset.at_limit:
-                    add_detail("需要先撞到用量上限才能使用。", muted=True)
-                elif reset.usable_now:
-                    add_detail("现在就可以使用。", muted=True)
+            for index, grant in enumerate(reset.grants, start=1):
+                claimable = reset.claimable(grant)
+                if claimable:
+                    grants_by_id[grant.grant_id] = grant
+                tk.Radiobutton(
+                    list_frame,
+                    text=f"{index}. {describe(grant, reset)}",
+                    value=grant.grant_id,
+                    variable=selected_grant,
+                    command=sync_buttons,
+                    state="normal" if claimable else "disabled",
+                    fg=FG,
+                    bg=BG,
+                    activebackground=BG,
+                    activeforeground=FG,
+                    disabledforeground=FG_MUTED,
+                    selectcolor=BG,
+                    font=dialog_font,
+                    anchor="w",
+                    justify="left",
+                    bd=0,
+                    highlightthickness=0,
+                ).pack(fill="x", pady=1)
+
+            if grants_by_id:
+                selected_grant.set(next(iter(grants_by_id)))
+            if reset.grants:
+                text = f"共 {reset.resets_left} 次可用重置。"
             else:
-                headline.configure(text="当前没有可用的用量重置。")
-                if reset.ineligible_reason:
-                    add_detail(
-                        CLAUDE_RESET_REASON_TEXT.get(
-                            reset.ineligible_reason, reset.ineligible_reason
-                        ),
-                        muted=True,
-                    )
-                else:
-                    add_detail("Anthropic 发放后会出现在这里。", muted=True)
-
-            weekly = parse_iso(reset.weekly_resets_at)
-            if weekly is not None:
-                if weekly.tzinfo is None:
-                    weekly = weekly.replace(tzinfo=timezone.utc)
-                add_detail(f"每周重置日：{weekly.astimezone():%Y-%m-%d %H:%M}", muted=True)
-
+                tk.Label(
+                    list_frame,
+                    text="账号里没有可用的用量重置。",
+                    fg=FG_MUTED,
+                    bg=BG,
+                    font=dialog_font,
+                    anchor="w",
+                    justify="left",
+                ).pack(fill="x")
+                reason = reset.ineligible_reason
+                text = CLAUDE_RESET_REASON_TEXT.get(reason, reason) if reason else ""
             status_label.configure(
-                text=(
-                    "使用方式：在 Claude Code 里运行 /limit-reset。"
-                    "核销接口官方未公开，UsageFloat 只负责显示。"
-                ),
+                text=f"{note} {text}".strip() if note else text,
                 fg=FG_MUTED,
             )
+            sync_buttons()
             place_settings_on_primary(win)
 
-        def reload_now() -> None:
-            if state["refreshing"]:
+        def load_grants() -> None:
+            if not alive() or state.get("claude_reset_busy"):
                 return
-            status_label.configure(text="正在刷新用量…", fg=FG_MUTED)
-            refresh_async(force=True)
-            # apply_data() replaces state["providers"]; re-read once it lands.
-            root.after(2500, render)
+            state["claude_reset_busy"] = True
+            sync_buttons()
+            status_label.configure(text="正在读取重置额度…", fg=FG_MUTED)
 
-        tk.Button(
+            def work() -> None:
+                try:
+                    fresh: ProviderUsage | None = fetch_claude_usage(force=True)
+                except Exception:
+                    _log_exception("claude reset status")
+                    fresh = None
+
+                def deliver() -> None:
+                    state["claude_reset_busy"] = False
+                    if fresh is None or not fresh.available:
+                        render_grants(None, "读取重置额度失败")
+                        return
+                    # Share the fresh read with the HUD so its 5h number and
+                    # reset mark agree with what the dialog lists.
+                    state["providers"] = [
+                        fresh if p.provider_id == "claude" else p
+                        for p in state.get("providers") or []
+                    ]
+                    render(relayout=not state.get("panel_active"))
+                    render_grants(fresh, None)
+
+                root.after(0, deliver)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def finish(claim: ClaudeResetClaim) -> None:
+            state["claude_reset_busy"] = False
+            if claim.settled:
+                state["claude_reset_unsettled"] = None
+            if not alive():
+                if claim.ok:
+                    refresh_async(force=True)
+                return
+            if claim.ok:
+                # Reloading the grants also refreshes the HUD's claude rows.
+                pending_note["text"] = claim.message
+                load_grants()
+            else:
+                status_label.configure(text=claim.message, fg=RED)
+                sync_buttons()
+
+        def use_selected() -> None:
+            if state.get("claude_reset_busy"):
+                return
+            grant_id = selected_grant.get()
+            grant = grants_by_id.get(grant_id)
+            if grant is None:
+                return
+            from tkinter import messagebox
+
+            windows = window_names(grant.clears) or "用量窗口"
+            if not messagebox.askokcancel(
+                "使用用量重置",
+                f"使用后这次重置立即作废，claude 的{windows}会重新开始计算。\n"
+                "确定要使用吗？",
+                parent=win,
+            ):
+                return
+            # Resend the id of an attempt whose outcome never arrived, so the
+            # server dedupes it rather than spending a second reset.
+            unsettled = state.get("claude_reset_unsettled")
+            if unsettled and unsettled[0] == grant_id:
+                request_id = unsettled[1]
+            else:
+                request_id = str(uuid.uuid4())
+                state["claude_reset_unsettled"] = (grant_id, request_id)
+            state["claude_reset_busy"] = True
+            sync_buttons()
+            status_label.configure(text="正在使用重置…", fg=FG_MUTED)
+
+            def work() -> None:
+                try:
+                    claim = claim_claude_reset(grant_id, request_id=request_id)
+                except Exception:
+                    _log_exception("claude reset claim")
+                    claim = ClaudeResetClaim(False, "使用失败", settled=False)
+                root.after(0, lambda: finish(claim))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        use_btn = tk.Button(
             btn_row,
-            text="刷新",
-            command=reload_now,
+            text="使用",
+            command=use_selected,
             bg="#f0f0f0",
             fg=FG,
             relief="flat",
             padx=12,
             pady=4,
             font=dialog_font,
-        ).pack(side="right")
+            state="disabled",
+        )
+        use_btn.pack(side="right")
+        reload_btn = tk.Button(
+            btn_row,
+            text="刷新列表",
+            command=load_grants,
+            bg="#f0f0f0",
+            fg=FG,
+            relief="flat",
+            padx=12,
+            pady=4,
+            font=dialog_font,
+        )
+        reload_btn.pack(side="right", padx=(0, 8))
         tk.Button(
             btn_row,
             text="关闭",
@@ -8061,11 +8409,18 @@ def run_ui() -> None:
 
         win.protocol("WM_DELETE_WINDOW", close)
         win.bind("<Escape>", lambda _event: close())
-        render()
+        # The usage read already carries the grants; reuse it instead of
+        # another call to an endpoint that answers 429 readily.
+        provider = claude_provider()
+        cached = provider is not None and provider.reset_block is not None
+        if cached:
+            render_grants(provider, None)
         place_settings_on_primary(win)
         win.deiconify()
         win.lift()
         win.focus_set()
+        if not cached:
+            load_grants()
 
     def open_codex_reset_cards(provider_id: str = "codex") -> None:
         account = CODEX_ACCOUNT_BY_ID.get(provider_id) or CODEX_ACCOUNTS[0]
@@ -8786,15 +9141,16 @@ def main(argv: list[str] | None = None) -> int:
             active_providers(list(once_cfg.get("providers") or DEFAULT_PROVIDERS)),
             force=True,
         )
-        for row in iter_display_rows(providers):
+        for row in iter_display_rows(
+            providers, list(once_cfg.get("providers") or DEFAULT_PROVIDERS)
+        ):
             if row.failed:
                 print(f"{row.title}  更新失败")
                 continue
             right = row.summary or ""
             if row.used_pct is not None:
                 rem = format_remaining(row.resets_at)
-                mark = RESET_AVAILABLE_MARK if row.reset_available else ""
-                right = (row.summary or f"{row.used_pct:.0f}%") + mark + (
+                right = (row.summary or f"{row.used_pct:.0f}%") + (
                     f"  {rem}" if rem else ""
                 )
             print(f"{row.title}  {right}".rstrip())

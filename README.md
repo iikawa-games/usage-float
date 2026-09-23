@@ -65,7 +65,7 @@ python usage_float.py autostart on  # 开机自启
 |------|------|
 | 点击左下角刷新区 | 手动刷新 |
 | 点击 Codex 用量数字 | 弹出该账号的重置卡列表 |
-| 点击 Claude `5h` 用量数字 | 查看本周的用量重置额度 |
+| 点击 Claude `5h` 用量数字 | 弹出 Claude 的用量重置列表 |
 | 拖动 | 移动悬浮窗 |
 | 右键 | 刷新 / 设置 / 切换专用副屏 / 置顶 / 开机自启 / 退出 |
 | 快捷键（默认连按两次 Ctrl） | 用量仪表盘 ↔ 动态壁纸；可在设置里改成连按 N 次或组合键 |
@@ -80,6 +80,7 @@ python usage_float.py autostart on  # 开机自启
 - **扫描 provider**：读取本机登录态，列出已知 provider 以及是否已登录
 - **勾选「显示」**：只把勾上的用量画到面板上；空格键也可切换当前行
 - **拖动行**：按住名称或状态列上下拖，调整面板顺序（点第一列是勾选，不是拖动）
+- Claude 拆成 `fable 7d`、`claude 7d`、`claude 5h` 三行，各自勾选、各自排序，可以和其他 provider 穿插
 
 未登录的 provider 即使勾选了也不会占位，登录之后才会出现。勾选和顺序写在 `~/.usage-float/config.json` 的 `providers` / `provider_order` / `disabled_providers`，一般用设置页改即可。LLM Proxy 的重置时区也在这一页，默认 UTC+8。
 
@@ -112,7 +113,7 @@ python usage_float.py autostart on  # 开机自启
 
 ## Claude 用量重置
 
-Anthropic 会给符合条件的账号发「用量重置」（CLI 里的 `/limit-reset`，内部代号 cedar-ember）。有未用完的额度时，`claude 5h` 那一行的数字后面会带一个 `↺`，点开可以看到：张数、有效期、能重置哪些窗口、每周重置日。
+Anthropic 会给符合条件的账号发「用量重置」（CLI 里的 `/limit-reset`，内部代号 cedar-ember）。点 `claude 5h` 那一行的数字，弹窗和 Codex 重置卡一样：列出每份额度的有效期和能重置的窗口，选中后点「使用」、确认即可。
 
 状态跟在现有用量请求上读，**不增加任何额外调用**：
 
@@ -120,10 +121,18 @@ Anthropic 会给符合条件的账号发「用量重置」（CLI 里的 `/limit-
 GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1
 ```
 
-两点说明：
-
 - 这个字段只发给 CLI，普通请求会返回 `ineligible_reason: "surface"`。所以该请求会带上本机已装的 Claude Code 版本号伪装成 CLI（`User-Agent: claude-cli/<版本>`、`anthropic-client-platform: cli`）。版本号从已安装的 `@anthropic-ai/claude-code/package.json` 实时读取，不写死。
-- **只显示，不核销。** 核销接口在 CLI 的懒加载 chunk 里，未公开也无法从二进制里提取，所以要用掉额度请在 Claude Code 里运行 `/limit-reset`。
+
+使用时发的请求和 CLI 的 `/limit-reset` 完全一样：
+
+```
+POST https://api.anthropic.com/api/organizations/<organizationUuid>/reset_rate_limits
+{"program": "cedar_ember", "grant_id": "<next_grant_id>", "request_id": "<uuid>"}
+```
+
+- 服务端只核销 `next_grant_id` 指向的那一份，其余额度在列表里显示为「排队中」、不可选。
+- 组织 ID 取自 `~/.claude.json` 的 `oauthAccount.organizationUuid`，取不到再查 `/api/oauth/profile`。
+- 没收到结果（断网、5xx、429）时，下次重试沿用同一个 `request_id`，服务端据此去重，不会多扣一次。
 
 ## LiteLLM 代理用量
 

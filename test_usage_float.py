@@ -633,6 +633,13 @@ class AuxiliaryPanelTests(unittest.TestCase):
         self.assertEqual(metrics.meta_points, 24)
         self.assertEqual(metrics.footer_points, 20)
 
+    def test_panel_type_shrinks_when_a_fourth_row_is_needed(self) -> None:
+        metrics = _panel_metrics(960, 640, 7, 96)
+        self.assertEqual((metrics.columns, metrics.rows), (2, 4))
+        self.assertLess(metrics.title_points, 28)
+        self.assertLess(metrics.value_points, 48)
+        self.assertEqual(metrics.footer_points, 20)
+
     def test_monitor_label_and_negative_tk_geometry_are_stable(self) -> None:
         monitor = self.monitor(r"\\.\DISPLAY3", 960, 640, x=-960, dpi=144)
 
@@ -858,11 +865,11 @@ class CodexMultiAccountTests(unittest.TestCase):
 
         self.assertEqual(
             config["providers"],
-            ["claude", "codex", "codex-2", "grok", "llmproxy"],
+            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy"],
         )
         self.assertEqual(
             config["provider_order"],
-            ["claude", "codex", "codex-2", "grok", "llmproxy"],
+            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy"],
         )
         self.assertEqual(config["disabled_providers"], [])
 
@@ -1098,8 +1105,8 @@ class ProviderConfigTests(unittest.TestCase):
             [],
             ["claude", "codex", "grok"],
         )
-        self.assertEqual(order, ["claude", "codex", "codex-2", "grok", "llmproxy"])
-        self.assertEqual(enabled, ["claude", "codex", "codex-2", "grok", "llmproxy"])
+        self.assertEqual(order, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy"])
+        self.assertEqual(enabled, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy"])
         self.assertEqual(disabled, [])
 
     def test_disabled_providers_keep_order_and_stay_hidden(self) -> None:
@@ -1108,9 +1115,9 @@ class ProviderConfigTests(unittest.TestCase):
             ["claude"],
             ["grok", "codex", "claude"],
         )
-        self.assertEqual(order, ["grok", "codex", "codex-2", "claude", "llmproxy"])
+        self.assertEqual(order, ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "llmproxy"])
         self.assertEqual(enabled, ["grok", "codex", "codex-2", "llmproxy"])
-        self.assertEqual(disabled, ["claude"])
+        self.assertEqual(disabled, ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_unchecking_every_row_stays_empty(self) -> None:
         order, enabled, disabled = usage_float_module.resolve_provider_config(
@@ -1125,15 +1132,15 @@ class ProviderConfigTests(unittest.TestCase):
     def test_move_provider_places_source_on_target_index(self) -> None:
         self.assertEqual(
             usage_float_module.move_provider(
-                ["codex", "grok", "claude"], "codex", "claude"
+                ["codex", "grok", "claude:5h"], "codex", "claude:5h"
             ),
-            ["grok", "claude", "codex"],
+            ["grok", "claude:5h", "codex"],
         )
         self.assertEqual(
             usage_float_module.move_provider(
-                ["codex", "grok", "claude"], "claude", "codex"
+                ["codex", "grok", "claude:5h"], "claude:5h", "codex"
             ),
-            ["claude", "codex", "grok"],
+            ["claude:5h", "codex", "grok"],
         )
 
     def test_load_config_preserves_explicit_disabled_list(self) -> None:
@@ -1154,10 +1161,10 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             config["provider_order"],
-            ["grok", "codex", "codex-2", "claude", "llmproxy"],
+            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "llmproxy"],
         )
         self.assertEqual(config["providers"], ["grok", "codex", "codex-2", "llmproxy"])
-        self.assertEqual(config["disabled_providers"], ["claude"])
+        self.assertEqual(config["disabled_providers"], ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_scan_providers_reports_login_state_in_saved_order(self) -> None:
         availability = {
@@ -1170,7 +1177,9 @@ class ProviderConfigTests(unittest.TestCase):
         with patch.object(
             usage_float_module,
             "provider_available",
-            side_effect=lambda pid: availability.get(pid, False),
+            side_effect=lambda pid: availability.get(
+                usage_float_module.provider_fetch_id(pid), False
+            ),
         ):
             rows = usage_float_module.scan_providers(
                 ["grok", "codex"],
@@ -1179,9 +1188,10 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             [row["id"] for row in rows],
-            ["grok", "codex", "codex-2", "claude", "llmproxy"],
+            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "llmproxy"],
         )
         self.assertEqual(rows[0]["label"], "Grok")
+        self.assertEqual(rows[3]["label"], "fable 7d")
         self.assertTrue(rows[0]["available"])
         self.assertFalse(rows[3]["available"])
 
@@ -1316,19 +1326,53 @@ class ClaudeResetTests(unittest.TestCase):
             reset_block=block,
         )
 
-    def test_only_the_refillable_window_is_marked_on_the_hud(self) -> None:
-        rows = iter_display_rows([self.claude_provider(self.block())])
-        by_window = {row.window_id: row for row in rows}
+    def test_settings_items_order_and_filter_claude_rows(self) -> None:
+        provider = self.claude_provider(self.block())
+        provider.windows.insert(
+            1, UsageWindow(id="seven_day", label="7d", used_pct=40.0)
+        )
+        codex = ProviderUsage(
+            provider_id="codex",
+            display_name="codex",
+            windows=[UsageWindow(id="w", label="5h", used_pct=1.0)],
+        )
 
-        self.assertTrue(by_window["five_hour"].reset_available)
-        # The grant clears the account-wide seven_day window, which this HUD
-        # does not render; the model-scoped weekly row must stay unmarked.
-        self.assertFalse(by_window["weekly_fable"].reset_available)
+        rows = iter_display_rows(
+            [provider, codex], ["claude:5h", "codex", "claude:fable"]
+        )
 
-    def test_no_grant_leaves_every_row_unmarked(self) -> None:
-        rows = iter_display_rows([self.claude_provider(self.block(grants=[]))])
+        self.assertEqual(
+            [row.title for row in rows], ["claude 5h", "codex", "fable 7d"]
+        )
+        # Every row still shows when no Settings order is given.
+        self.assertEqual(len(iter_display_rows([provider, codex])), 4)
 
-        self.assertFalse(any(row.reset_available for row in rows))
+    def test_a_failed_claude_line_takes_its_first_rows_place(self) -> None:
+        failed = ProviderUsage(
+            provider_id="claude", display_name="claude", available=False, error="更新失败"
+        )
+        codex = ProviderUsage(
+            provider_id="codex",
+            display_name="codex",
+            windows=[UsageWindow(id="w", label="5h", used_pct=1.0)],
+        )
+
+        rows = iter_display_rows([codex, failed], ["claude:5h", "codex"])
+        self.assertEqual([row.title for row in rows], ["claude", "codex"])
+        self.assertEqual(iter_display_rows([codex, failed], ["codex"])[0].title, "codex")
+        self.assertEqual(len(iter_display_rows([codex, failed], ["codex"])), 1)
+
+    def test_claude_items_fetch_claude_once(self) -> None:
+        calls = []
+        with patch.object(
+            usage_float_module,
+            "fetch_claude_usage",
+            side_effect=lambda **_kw: calls.append(1) or ProviderUsage(provider_id="claude"),
+        ):
+            out = usage_float_module.fetch_all(["claude:fable", "claude:5h"])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([p.provider_id for p in out], ["claude"])
 
     def test_only_the_claude_session_row_opens_the_reset_dialog(self) -> None:
         rows = iter_display_rows([self.claude_provider(self.block())])
@@ -1354,6 +1398,82 @@ class ClaudeResetTests(unittest.TestCase):
         self.assertEqual(headers["anthropic-client-version"], version)
         self.assertTrue(headers["User-Agent"].startswith(f"claude-cli/{version}"))
         self.assertIn("cedar_ember=1", usage_float_module.CLAUDE_USAGE_RESET_URL)
+
+    def test_only_the_next_usable_grant_is_claimable(self) -> None:
+        queued = dict(self.LIVE_GRANT, id="queued", ends_at="2026-12-01T00:00:00+00:00")
+        status = parse_claude_reset_status(
+            self.block(grants=[queued, dict(self.LIVE_GRANT)])
+        )
+
+        self.assertEqual(
+            [g.grant_id for g in status.grants], [self.LIVE_GRANT["id"], "queued"]
+        )
+        self.assertTrue(status.claimable(status.grants[0]))
+        self.assertFalse(status.claimable(status.grants[1]))
+
+        waiting = parse_claude_reset_status(
+            self.block(grants=[dict(self.LIVE_GRANT, usable_now=False)])
+        )
+        self.assertFalse(waiting.claimable(waiting.grants[0]))
+
+    # No test below reaches the network: a real claim would spend the reset.
+    def claim(self, response, *, grant_id=None, request_id="req-1"):
+        calls = []
+
+        def fake(url, **kwargs):
+            calls.append((url, kwargs))
+            return response
+
+        with patch.object(
+            usage_float_module, "claude_organization_uuid", return_value="org-1"
+        ), patch.object(usage_float_module, "claude_authorized_json", side_effect=fake):
+            result = usage_float_module.claim_claude_reset(
+                grant_id or self.LIVE_GRANT["id"], request_id=request_id
+            )
+        return result, calls
+
+    def test_claim_posts_the_cli_payload_to_the_org_endpoint(self) -> None:
+        result, calls = self.claim(
+            (200, {"result": "reset", "resets_left": 0, "cleared": ["five_hour"]})
+        )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.settled)
+        self.assertIn("5 小时会话", result.message)
+        url, kwargs = calls[0]
+        self.assertEqual(
+            url, "https://api.anthropic.com/api/organizations/org-1/reset_rate_limits"
+        )
+        self.assertEqual(kwargs["method"], "POST")
+        self.assertEqual(
+            kwargs["body"],
+            {
+                "program": "cedar_ember",
+                "grant_id": self.LIVE_GRANT["id"],
+                "request_id": "req-1",
+            },
+        )
+
+    def test_a_refused_claim_is_settled_and_not_reported_as_success(self) -> None:
+        result, _calls = self.claim((200, {"result": "not_limited"}))
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.settled)
+        self.assertIn("未消耗", result.message)
+
+    def test_an_unanswered_claim_stays_unsettled_so_its_id_is_reused(self) -> None:
+        for response in ((0, "timed out"), (502, None), (429, None)):
+            result, _calls = self.claim(response)
+            self.assertFalse(result.ok)
+            self.assertFalse(result.settled)
+
+    def test_malformed_ids_are_never_sent(self) -> None:
+        for grant_id, request_id in (("Bad Id", "req"), ("ok", "has space"), ("ok", "")):
+            result, calls = self.claim(
+                (200, {"result": "reset"}), grant_id=grant_id, request_id=request_id
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
