@@ -65,7 +65,8 @@ python usage_float.py autostart on  # 开机自启
 |------|------|
 | 点击左下角刷新区 | 手动刷新 |
 | 点击 Codex 用量数字 | 弹出该账号的重置卡列表 |
-| 点击 Claude `5h` 用量数字 | 弹出 Claude 的用量重置列表 |
+| 点击 Claude `7d` 用量数字 | 弹出 Claude 的用量重置列表 |
+| 点击 Claude `5h` 用量数字 | 弹出 Claude 的 5 小时重置 |
 | 拖动 | 移动悬浮窗 |
 | 右键 | 刷新 / 设置 / 切换专用副屏 / 置顶 / 开机自启 / 退出 |
 | 快捷键（默认连按两次 Ctrl） | 用量仪表盘 ↔ 动态壁纸；可在设置里改成连按 N 次或组合键 |
@@ -113,7 +114,7 @@ python usage_float.py autostart on  # 开机自启
 
 ## Claude 用量重置
 
-Anthropic 会给符合条件的账号发「用量重置」（CLI 里的 `/limit-reset`，内部代号 cedar-ember）。点 `claude 5h` 那一行的数字，弹窗和 Codex 重置卡一样：列出每份额度的有效期和能重置的窗口，选中后点「使用」、确认即可。
+Anthropic 会给符合条件的账号发「用量重置」（CLI 里的 `/limit-reset`，内部代号 cedar-ember）。点 `claude 7d` 那一行的数字，弹窗和 Codex 重置卡一样：列出每份额度的有效期和能重置的窗口，选中后点「使用」、确认即可。
 
 状态跟在现有用量请求上读，**不增加任何额外调用**：
 
@@ -133,6 +134,17 @@ POST https://api.anthropic.com/api/organizations/<organizationUuid>/reset_rate_l
 - 服务端只核销 `next_grant_id` 指向的那一份，其余额度在列表里显示为「排队中」、不可选。
 - 组织 ID 取自 `~/.claude.json` 的 `oauthAccount.organizationUuid`，取不到再查 `/api/oauth/profile`。
 - 没收到结果（断网、5xx、429）时，下次重试沿用同一个 `request_id`，服务端据此去重，不会多扣一次。
+
+### 5 小时重置
+
+点 `claude 5h` 的数字打开另一份重置：每周一次、只重置 5 小时会话（CLI 内部代号 juniper-tide）。它是实验功能，只有被分到 `reset` 组的账号才有，而且要真正撞到 5 小时上限才开放。普通用量请求里这个字段是 `null`，只有 CLI 撞到上限时用的 `?at_wall=1&skip_spend=1` 才会填，所以打开这个弹窗时会单独读一次（只读），使用时发：
+
+```
+POST https://api.anthropic.com/api/organizations/<organizationUuid>/reset_rate_limits
+{"program": "juniper_tide"}
+```
+
+这个请求没有 `request_id`，每周一次的额度本身防止重复核销（第二次会返回 `already_used`）。
 
 ## LiteLLM 代理用量
 

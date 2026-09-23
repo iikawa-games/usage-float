@@ -44,7 +44,7 @@ APP_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", HOME / ".claude"))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 CODEX_HOME_2 = Path(os.environ.get("CODEX_HOME_2", HOME / ".codex-2"))
@@ -72,6 +72,9 @@ CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 # entitlement. Its status rides along on the usage endpoint as a query flag,
 # so reading it costs no extra call against an API that answers 429 easily.
 CLAUDE_USAGE_RESET_URL = f"{CLAUDE_USAGE_URL}?cedar_ember=1&skip_spend=1"
+# The 5h session reset (juniper_tide) is only filled in on the read the CLI
+# makes at a limit; the regular read above returns it as null.
+CLAUDE_USAGE_AT_WALL_URL = f"{CLAUDE_USAGE_URL}?at_wall=1&skip_spend=1"
 CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 # Redeem call used by the CLI's /limit-reset, keyed by the OAuth organization.
 CLAUDE_RESET_CLAIM_URL = "https://api.anthropic.com/api/organizations/{org}/reset_rate_limits"
@@ -2678,6 +2681,120 @@ def claim_claude_reset(grant_id: str, *, request_id: str) -> ClaudeResetClaim:
     )
 
 
+CLAUDE_SESSION_RESET_PROGRAM = "juniper_tide"
+
+
+@dataclass
+class ClaudeSessionReset:
+    """Claude's weekly 5h session reset (juniper_tide).
+
+    It is an experiment: only accounts in its "reset" arm get one, and the
+    server only opens it once the 5h window is actually at its limit.
+    """
+
+    eligible: bool = False
+    ineligible_reason: str | None = None
+    in_experiment: bool = False
+    arm: str | None = None
+    available: bool = False
+    next_available_at: str | None = None
+    resets_per_week: int = 1
+
+    @property
+    def offered(self) -> bool:
+        return self.arm == "reset"
+
+    @property
+    def claimable(self) -> bool:
+        return self.eligible and self.offered and self.available
+
+
+CLAUDE_SESSION_REASON_TEXT = {
+    "tier": "当前订阅方案不包含 5 小时重置",
+    "tenure": "账号注册时间还不够",
+    "surface": "当前客户端不被允许使用",
+    "mobile": "移动端不可用",
+    "cli_version": "Claude Code 版本过低",
+    "not_at_wall": "到达 5 小时上限后才会开放",
+    "weekly_limit": "周额度已用完，5 小时重置无法使用",
+    "no_weekly_limit": "账号没有周额度限制，不需要重置",
+    "other_experiment": "账号在其他实验中",
+    "extra_usage": "已开启超额用量，不需要重置",
+}
+
+
+def parse_claude_session_reset(block: Any) -> ClaudeSessionReset:
+    if not isinstance(block, dict):
+        return ClaudeSessionReset()
+    reason = _first_present(block, "ineligible_reason", "ineligibleReason")
+    arm = _first_present(block, "arm")
+    return ClaudeSessionReset(
+        eligible=bool(_first_present(block, "eligible") or False),
+        ineligible_reason=str(reason) if reason else None,
+        in_experiment=bool(_first_present(block, "in_experiment", "inExperiment") or False),
+        arm=str(arm) if arm else None,
+        available=bool(_first_present(block, "available") or False),
+        next_available_at=_iso_timestamp(
+            _first_present(block, "next_available_at", "nextAvailableAt")
+        ),
+        resets_per_week=_claude_grant_int(block, "resets_per_week", "resetsPerWeek") or 1,
+    )
+
+
+def fetch_claude_session_reset() -> tuple[ClaudeSessionReset | None, str | None]:
+    """Read the 5h session reset. Only the 5h dialog calls this, on demand."""
+    status, payload = claude_authorized_json(CLAUDE_USAGE_AT_WALL_URL)
+    if status == 0 and payload is None:
+        return None, "未找到可用的 Claude 登录凭证"
+    if status == 429:
+        return None, "请求太频繁，稍后再试。"
+    if status != 200 or not isinstance(payload, dict):
+        return None, f"读取失败：{codex_error_text(status, payload)}"
+    return parse_claude_session_reset(payload.get("juniper_tide")), None
+
+
+CLAUDE_SESSION_RESULT_TEXT = {
+    "already_used": "本周的 5 小时重置已经用过了。",
+    "not_limited": "还没到 5 小时上限，暂时不能使用，额度未消耗。",
+    "ineligible": "当前账号不符合使用条件。",
+    "unavailable": "重置暂不可用，稍后再试。",
+}
+
+
+def claim_claude_session_reset() -> ClaudeResetClaim:
+    """Spend this week's 5h session reset. Only call after the user confirms.
+
+    The CLI sends no request id for this program; the weekly quota itself is
+    what stops a retried click from spending twice ("already_used").
+    """
+    org = claude_organization_uuid()
+    if not org:
+        return ClaudeResetClaim(False, "找不到 Claude 组织信息，请在 Claude Code 里重新登录。")
+    status, payload = claude_authorized_json(
+        CLAUDE_RESET_CLAIM_URL.format(org=urllib.parse.quote(org, safe="")),
+        method="POST",
+        body={"program": CLAUDE_SESSION_RESET_PROGRAM},
+        timeout=25.0,
+    )
+    if status == 0 and payload is None:
+        return ClaudeResetClaim(False, "未找到可用的 Claude 登录凭证")
+    if status == 200 and isinstance(payload, dict):
+        result = str(payload.get("result") or "unavailable")
+        if result == "reset":
+            return ClaudeResetClaim(True, "5 小时会话已重置。")
+        return ClaudeResetClaim(
+            False,
+            CLAUDE_SESSION_RESULT_TEXT.get(result, CLAUDE_SESSION_RESULT_TEXT["unavailable"]),
+        )
+    if status == 429:
+        return ClaudeResetClaim(False, "请求太频繁，稍后再试。", settled=False)
+    if status in (401, 403):
+        return ClaudeResetClaim(False, "Claude 登录已失效，请在 Claude Code 里重新登录。")
+    return ClaudeResetClaim(
+        False, f"使用失败：{codex_error_text(status, payload)}", settled=False
+    )
+
+
 def fetch_claude_usage(*, force: bool = False) -> ProviderUsage:
     if claude_in_backoff() and not force:
         return ProviderUsage(
@@ -3871,12 +3988,20 @@ class DisplayRow:
 def row_opens_reset_ui(row: DisplayRow) -> bool:
     """Whether clicking this row's number should open a reset dialog.
 
-    Every Codex account has cards to list. Claude only has the one weekly
-    session reset, so only its 5h row is wired up.
+    Every Codex account has cards to list. Claude's 7d row opens the
+    usage-limit grants (they refill the weekly window) and its 5h row opens
+    the weekly 5h session reset.
     """
     if row.provider_id in CODEX_ACCOUNT_BY_ID:
         return True
-    return row.provider_id == "claude" and row.window_id == "five_hour"
+    return row.provider_id == "claude" and row.window_id in ("five_hour", "seven_day")
+
+
+def reset_target_id(row: DisplayRow) -> str:
+    """What a click on this row's number opens: a Codex account or a Claude row."""
+    if row.provider_id == "claude":
+        return display_item(row) or row.provider_id
+    return row.provider_id
 
 
 def display_item(row: DisplayRow) -> str | None:
@@ -4780,6 +4905,8 @@ def run_ui() -> None:
         "refresh_hover": False,
         "reset_cards_win": None,
         "claude_reset_win": None,
+        "claude_session_win": None,
+        "claude_session_busy": False,
         "claude_reset_busy": False,
         # (grant_id, request_id) of a claim whose outcome never arrived.
         "claude_reset_unsettled": None,
@@ -5520,8 +5647,8 @@ def run_ui() -> None:
     def reset_target_at_event(event: tk.Event) -> str | None:
         """Which provider's usage number sits under the pointer, if any.
 
-        Returns a Codex account id or "claude"; the caller opens whichever
-        reset UI that provider has.
+        Returns a Codex account id or a Claude row ("claude:7d" / "claude:5h");
+        the caller opens whichever reset UI that target has.
         """
         point = _event_local_point(event)
         if point is None:
@@ -5634,8 +5761,10 @@ def run_ui() -> None:
 
     def open_reset_ui(provider_id: str) -> None:
         """Send the click to whichever reset UI this provider has."""
-        if provider_id == "claude":
+        if provider_id == "claude:7d":
             open_claude_reset_info()
+        elif provider_id == "claude:5h":
+            open_claude_session_reset()
         elif provider_id in CODEX_ACCOUNT_BY_ID:
             open_codex_reset_cards(provider_id)
 
@@ -5906,7 +6035,7 @@ def run_ui() -> None:
             )
 
             if pct_text and row_opens_reset_ui(dr):
-                reset_targets.append((value_label, dr.provider_id))
+                reset_targets.append((value_label, reset_target_id(dr)))
 
             if pct_text:
                 bar = tk.Canvas(
@@ -6036,7 +6165,7 @@ def run_ui() -> None:
                 pct_lbl.pack(side="right", padx=(0, 4))
                 bind_drag(pct_lbl)
                 if pct_t and row_opens_reset_ui(dr):
-                    reset_targets.append((pct_lbl, dr.provider_id))
+                    reset_targets.append((pct_lbl, reset_target_id(dr)))
 
             left = tk.Label(
                 row,
@@ -8421,6 +8550,270 @@ def run_ui() -> None:
         win.focus_set()
         if not cached:
             load_grants()
+
+    def open_claude_session_reset() -> None:
+        """Claude's weekly 5h session reset, laid out like the Codex card dialog."""
+        existing = state.get("claude_session_win")
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    place_settings_on_primary(existing)
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_set()
+                    return
+            except Exception:
+                pass
+
+        win = tk.Toplevel(root)
+        # Same reason as the settings dialog: map once, at the final position.
+        win.withdraw()
+        state["claude_session_win"] = win
+        state["claude_session_busy"] = False
+        win.title("claude 5 小时重置")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+
+        dialog_font = tkfont.Font(family=font_family, size=10)
+        dialog_font_small = tkfont.Font(family=font_family, size=9)
+        setattr(win, "_usage_float_fonts", (dialog_font, dialog_font_small))
+
+        shell = tk.Frame(win, bg=BG, padx=14, pady=12)
+        shell.pack(fill="both", expand=True)
+
+        tk.Label(
+            shell,
+            text="选择一次重置，立即重置 claude 的 5 小时会话。",
+            fg=FG,
+            bg=BG,
+            font=dialog_font,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x")
+
+        list_frame = tk.Frame(shell, bg=BG, width=360)
+        list_frame.pack(fill="both", expand=True, pady=(10, 6))
+
+        status_label = tk.Label(
+            shell,
+            text="",
+            fg=FG_MUTED,
+            bg=BG,
+            font=dialog_font_small,
+            anchor="w",
+            justify="left",
+            wraplength=360,
+        )
+        status_label.pack(fill="x")
+
+        btn_row = tk.Frame(shell, bg=BG)
+        btn_row.pack(fill="x", pady=(10, 0))
+
+        selected = tk.StringVar(value="")
+        pending_note = {"text": ""}
+
+        def alive() -> bool:
+            try:
+                return bool(win.winfo_exists())
+            except Exception:
+                return False
+
+        def close() -> None:
+            state["claude_session_win"] = None
+            state["claude_session_busy"] = False
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def sync_buttons() -> None:
+            if not alive():
+                return
+            busy = bool(state.get("claude_session_busy"))
+            try:
+                use_btn.configure(state="disabled" if busy or not selected.get() else "normal")
+                reload_btn.configure(state="disabled" if busy else "normal")
+            except Exception:
+                pass
+
+        def render_reset(reset: ClaudeSessionReset | None, error: str | None) -> None:
+            if not alive():
+                return
+            for widget in list(list_frame.winfo_children()):
+                try:
+                    widget.destroy()
+                except Exception:
+                    pass
+            selected.set("")
+            note = pending_note["text"]
+            pending_note["text"] = ""
+
+            if error or reset is None:
+                status_label.configure(text=error or "读取重置额度失败", fg=RED)
+                sync_buttons()
+                place_settings_on_primary(win)
+                return
+
+            if reset.offered:
+                parts = [f"每周 {reset.resets_per_week} 次"]
+                remaining = format_remaining(reset.next_available_at)
+                if reset.available:
+                    parts.append("本周可用")
+                elif remaining:
+                    parts.append(f"{remaining} 后可用")
+                else:
+                    parts.append("本周已用")
+                tk.Radiobutton(
+                    list_frame,
+                    text=f"1. {' · '.join(parts)}",
+                    value="session",
+                    variable=selected,
+                    command=sync_buttons,
+                    state="normal" if reset.claimable else "disabled",
+                    fg=FG,
+                    bg=BG,
+                    activebackground=BG,
+                    activeforeground=FG,
+                    disabledforeground=FG_MUTED,
+                    selectcolor=BG,
+                    font=dialog_font,
+                    anchor="w",
+                    justify="left",
+                    bd=0,
+                    highlightthickness=0,
+                ).pack(fill="x", pady=1)
+                if reset.claimable:
+                    selected.set("session")
+            else:
+                tk.Label(
+                    list_frame,
+                    text="账号里没有可用的 5 小时重置。",
+                    fg=FG_MUTED,
+                    bg=BG,
+                    font=dialog_font,
+                    anchor="w",
+                    justify="left",
+                ).pack(fill="x")
+
+            if reset.claimable:
+                text = "共 1 次可用重置。"
+            else:
+                reason = reset.ineligible_reason
+                text = CLAUDE_SESSION_REASON_TEXT.get(reason, reason) if reason else ""
+            status_label.configure(
+                text=f"{note} {text}".strip() if note else text,
+                fg=FG_MUTED,
+            )
+            sync_buttons()
+            place_settings_on_primary(win)
+
+        def load_reset() -> None:
+            if not alive() or state.get("claude_session_busy"):
+                return
+            state["claude_session_busy"] = True
+            sync_buttons()
+            status_label.configure(text="正在读取重置额度…", fg=FG_MUTED)
+
+            def work() -> None:
+                try:
+                    reset, error = fetch_claude_session_reset()
+                except Exception:
+                    _log_exception("claude session reset status")
+                    reset, error = None, "读取重置额度失败"
+
+                def deliver() -> None:
+                    state["claude_session_busy"] = False
+                    render_reset(reset, error)
+
+                root.after(0, deliver)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def finish(claim: ClaudeResetClaim) -> None:
+            state["claude_session_busy"] = False
+            if not alive():
+                if claim.ok:
+                    refresh_async(force=True)
+                return
+            if claim.ok:
+                pending_note["text"] = claim.message
+                refresh_async(force=True)
+                load_reset()
+            else:
+                status_label.configure(text=claim.message, fg=RED)
+                sync_buttons()
+
+        def use_selected() -> None:
+            if state.get("claude_session_busy") or not selected.get():
+                return
+            from tkinter import messagebox
+
+            if not messagebox.askokcancel(
+                "使用 5 小时重置",
+                "使用后本周的 5 小时重置立即作废，claude 的 5 小时会话会重新开始计算。\n"
+                "确定要使用吗？",
+                parent=win,
+            ):
+                return
+            state["claude_session_busy"] = True
+            sync_buttons()
+            status_label.configure(text="正在使用重置…", fg=FG_MUTED)
+
+            def work() -> None:
+                try:
+                    claim = claim_claude_session_reset()
+                except Exception:
+                    _log_exception("claude session reset claim")
+                    claim = ClaudeResetClaim(False, "使用失败", settled=False)
+                root.after(0, lambda: finish(claim))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        use_btn = tk.Button(
+            btn_row,
+            text="使用",
+            command=use_selected,
+            bg="#f0f0f0",
+            fg=FG,
+            relief="flat",
+            padx=12,
+            pady=4,
+            font=dialog_font,
+            state="disabled",
+        )
+        use_btn.pack(side="right")
+        reload_btn = tk.Button(
+            btn_row,
+            text="刷新列表",
+            command=load_reset,
+            bg="#f0f0f0",
+            fg=FG,
+            relief="flat",
+            padx=12,
+            pady=4,
+            font=dialog_font,
+        )
+        reload_btn.pack(side="right", padx=(0, 8))
+        tk.Button(
+            btn_row,
+            text="关闭",
+            command=close,
+            bg="#f0f0f0",
+            fg=FG,
+            relief="flat",
+            padx=12,
+            pady=4,
+            font=dialog_font,
+        ).pack(side="left")
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.bind("<Escape>", lambda _event: close())
+        place_settings_on_primary(win)
+        win.deiconify()
+        win.lift()
+        win.focus_set()
+        # The regular usage read doesn't carry this block, so read it now.
+        load_reset()
 
     def open_codex_reset_cards(provider_id: str = "codex") -> None:
         account = CODEX_ACCOUNT_BY_ID.get(provider_id) or CODEX_ACCOUNTS[0]

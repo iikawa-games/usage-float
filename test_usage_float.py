@@ -1374,11 +1374,80 @@ class ClaudeResetTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual([p.provider_id for p in out], ["claude"])
 
-    def test_only_the_claude_session_row_opens_the_reset_dialog(self) -> None:
-        rows = iter_display_rows([self.claude_provider(self.block())])
-        clickable = {row.window_id for row in rows if row_opens_reset_ui(row)}
+    def test_claude_7d_and_5h_rows_open_their_own_reset_dialogs(self) -> None:
+        provider = self.claude_provider(self.block())
+        provider.windows.insert(1, UsageWindow(id="seven_day", label="7d", used_pct=40.0))
+        rows = iter_display_rows([provider])
+        targets = {
+            row.window_id: usage_float_module.reset_target_id(row)
+            for row in rows
+            if row_opens_reset_ui(row)
+        }
 
-        self.assertEqual(clickable, {"five_hour"})
+        # fable 7d is a model-scoped window that no reset refills.
+        self.assertEqual(targets, {"seven_day": "claude:7d", "five_hour": "claude:5h"})
+
+    # Shape captured live from the same usage response (account not enrolled).
+    LIVE_SESSION_BLOCK = {
+        "eligible": False,
+        "ineligible_reason": "not_at_wall",
+        "in_experiment": False,
+        "arm": None,
+        "available": False,
+        "next_available_at": None,
+        "weekly_resets_at": None,
+        "resets_per_week": 1,
+        "event_props": None,
+    }
+
+    def test_an_unenrolled_session_reset_is_not_offered(self) -> None:
+        reset = usage_float_module.parse_claude_session_reset(self.LIVE_SESSION_BLOCK)
+
+        self.assertFalse(reset.offered)
+        self.assertFalse(reset.claimable)
+        self.assertEqual(reset.ineligible_reason, "not_at_wall")
+
+    def test_a_session_reset_is_claimable_only_when_available_in_the_reset_arm(self) -> None:
+        live = dict(self.LIVE_SESSION_BLOCK, eligible=True, ineligible_reason=None,
+                    in_experiment=True, arm="reset", available=True)
+        self.assertTrue(usage_float_module.parse_claude_session_reset(live).claimable)
+        for change in ({"arm": "control"}, {"available": False}, {"eligible": False}):
+            reset = usage_float_module.parse_claude_session_reset(dict(live, **change))
+            self.assertFalse(reset.claimable, change)
+
+    def test_session_reset_is_read_from_the_at_wall_usage_query(self) -> None:
+        # The regular usage read returns juniper_tide as null.
+        calls = []
+
+        def fake(url, **kwargs):
+            calls.append(url)
+            return 200, {"juniper_tide": self.LIVE_SESSION_BLOCK}
+
+        with patch.object(usage_float_module, "claude_authorized_json", side_effect=fake):
+            reset, error = usage_float_module.fetch_claude_session_reset()
+
+        self.assertIsNone(error)
+        self.assertEqual(reset.ineligible_reason, "not_at_wall")
+        self.assertIn("at_wall=1", calls[0])
+
+    def test_session_claim_posts_only_the_program(self) -> None:
+        calls = []
+
+        def fake(url, **kwargs):
+            calls.append((url, kwargs))
+            return 200, {"result": "already_used"}
+
+        # Mocked: a real claim would spend this week's reset.
+        with patch.object(
+            usage_float_module, "claude_organization_uuid", return_value="org-1"
+        ), patch.object(usage_float_module, "claude_authorized_json", side_effect=fake):
+            result = usage_float_module.claim_claude_session_reset()
+
+        self.assertFalse(result.ok)
+        self.assertIn("已经用过", result.message)
+        url, kwargs = calls[0]
+        self.assertTrue(url.endswith("/api/organizations/org-1/reset_rate_limits"))
+        self.assertEqual(kwargs["body"], {"program": "juniper_tide"})
 
     def test_reset_block_survives_the_usage_cache_round_trip(self) -> None:
         block = self.block()
