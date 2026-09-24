@@ -12,9 +12,9 @@ Windows 用量 HUD：把 Claude / Codex / Grok 订阅用量（以及可选的 Li
 
 ![用量设置](docs/screenshots/settings-usage.png)
 
-副屏设置：
+副屏与快捷键设置：
 
-![副屏设置](docs/screenshots/settings-display.png)
+![副屏与快捷键设置](docs/screenshots/settings-display.png)
 
 动态壁纸目录权重（PlayStation △□○✕ 为示例目录名）：
 
