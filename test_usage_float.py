@@ -39,6 +39,7 @@ from usage_float import (
     _normalize_wallpaper_disabled_folders,
     _other_shortcut_key_down,
     _panel_grid_shape,
+    _panel_layout_key,
     _panel_metrics,
     _point_in_box,
     _randomize_wallpaper_session,
@@ -639,6 +640,19 @@ class AuxiliaryPanelTests(unittest.TestCase):
         self.assertLess(metrics.title_points, 28)
         self.assertLess(metrics.value_points, 48)
         self.assertEqual(metrics.footer_points, 20)
+
+    def test_changed_values_reuse_the_panel_tiles(self) -> None:
+        # Values live on the tiles' labels; only the tile set forces a rebuild,
+        # which blanks the dedicated screen for a frame.
+        rows = [("codex", True), ("claude 5h", True), ("llmproxy", True)]
+        key = _panel_layout_key(2, 3, 21, 8, rows)
+
+        self.assertEqual(key, _panel_layout_key(2, 3, 21, 8, iter(rows)))
+        self.assertNotEqual(key, _panel_layout_key(2, 3, 21, 8, rows[:2]))
+        self.assertNotEqual(
+            key,
+            _panel_layout_key(2, 3, 21, 8, [("codex", True), ("claude 5h", False), ("llmproxy", True)]),
+        )
 
     def test_monitor_label_and_negative_tk_geometry_are_stable(self) -> None:
         monitor = self.monitor(r"\\.\DISPLAY3", 960, 640, x=-960, dpi=144)

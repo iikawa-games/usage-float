@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
@@ -44,7 +44,7 @@ APP_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", HOME / ".claude"))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 CODEX_HOME_2 = Path(os.environ.get("CODEX_HOME_2", HOME / ".codex-2"))
@@ -4393,6 +4393,23 @@ def _panel_grid_shape(row_count: int, width: int, height: int) -> tuple[int, int
     return columns, rows
 
 
+def _panel_layout_key(
+    columns: int,
+    grid_rows: int,
+    cell_gap: int,
+    bar_height: int,
+    rows: Iterable[tuple[str, bool]],
+) -> tuple[Any, ...]:
+    """What forces the panel tiles to be rebuilt instead of updated in place.
+
+    rows holds each tile's (title, has_usage_bar). Values, colors and reset
+    countdowns are written to the existing labels, so they stay out of the
+    key: rebuilding destroys every tile and the dedicated screen shows its
+    black background for a frame.
+    """
+    return (columns, grid_rows, cell_gap, bar_height, tuple(rows))
+
+
 def _panel_metrics(
     width: int,
     height: int,
@@ -5904,15 +5921,12 @@ def run_ui() -> None:
 
         columns, grid_rows = _panel_grid_shape(max(4, len(rows)), width, height)
         presentations = [_panel_row_presentation(dr) for dr in rows]
-        structure = (
+        structure = _panel_layout_key(
             columns,
             grid_rows,
             metrics.cell_gap,
             metrics.bar_height,
-            tuple(
-                (dr.title, bool(presentation[0]), presentation[1])
-                for dr, presentation in zip(rows, presentations)
-            ),
+            ((dr.title, bool(presentation[0])) for dr, presentation in zip(rows, presentations)),
         )
         items = state.get("panel_items") or []
         if state.get("panel_structure") == structure and len(items) == len(rows):
