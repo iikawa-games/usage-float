@@ -1,6 +1,6 @@
 # usage-float
 
-Windows 用量 HUD：把 Claude / Codex / Grok 订阅用量（以及可选的 LiteLLM 代理额度）铺在专用副屏上，双击 Ctrl 切到文件夹动态壁纸。无标题栏、不占任务栏。
+Windows 用量 HUD：把 Claude / Codex / Grok / Antigravity 订阅用量（以及可选的 LiteLLM 代理额度）铺在专用副屏上，双击 Ctrl 切到文件夹动态壁纸。无标题栏、不占任务栏。
 
 ## 截图
 
@@ -43,6 +43,7 @@ python usage_float.py autostart on  # 开机自启
 | Codex | `~/.codex/auth.json` |
 | Codex 第二账号 | `~/.codex-2/auth.json`（可用 `CODEX_HOME_2`） |
 | Grok | `~/.grok` 登录态 |
+| Antigravity | 官方 `agy` CLI 的登录态（1.1.11+）；支持 PATH、`%LOCALAPPDATA%\agy\bin\agy.exe` 或 `ANTIGRAVITY_CLI_PATH` |
 | LiteLLM 代理 | 环境变量 `LLM_PROXY_API_KEY` + `LLM_PROXY_ENDPOINT`，或配置里的 `llm_proxy_api_key` / `llm_proxy_endpoint` |
 
 登录第二个 Codex 账号：
@@ -70,11 +71,12 @@ $env:CODEX_HOME="$env:USERPROFILE\.codex-2"; codex login
 
 **用量**
 
-- **扫描 provider**：读取本机登录态，列出已知 provider 以及是否已登录
+- **扫描 provider**：检测本机可用的 provider，状态统一显示「已检测到 / 未检测到」；登录是否有效以实际用量查询为准
 - **勾选「显示」**：只画勾上的行；空格键切换当前行
 - **拖动行**：按住名称或状态列上下拖，调整面板顺序（点第一列是勾选，不是拖动）
 - Claude 拆成 `fable 7d`、`claude 7d`、`claude 5h` 三行，各自勾选、排序，可与其他 provider 穿插
-- 未登录的 provider 即使勾选也不占位，登录后才出现
+- Antigravity 拆成 `agy gemini 7d`、`agy gemini 5h`、`agy claude 7d`、`agy claude 5h` 四个独立设置项，各自勾选、排序，可与其他 provider 穿插。小浮窗将 Gemini 简称为 `gem`，保留窗口周期
+- 没有本机凭证的 provider 不占位；Antigravity 安装 CLI 后会查询。未登录或查询失败时，没有上次成功读数才显示「更新失败」
 - LiteLLM 代理的重置时区，默认 UTC+8
 
 **副屏**：选中目标显示器 → 打开「专用副屏模式」。程序按显示器硬件标识锁定副屏，重新插拔后再铺满；显示器被拔掉时临时退回悬浮窗。快捷键也在这一页，可改成连按 N 次或组合键。
@@ -129,6 +131,20 @@ POST https://api.anthropic.com/api/organizations/<organizationUuid>/reset_rate_l
 
 没有 `request_id`；每周一次的额度本身防止重复核销（第二次返回 `already_used`）。
 
+## Antigravity 用量
+
+读取官方 CLI 的结构化报告：
+
+```powershell
+agy -p /usage --output-format json
+```
+
+使用 CLI 自己的登录态，不读取或复制 token。查询在临时空目录运行，不发起模型推理；60 秒超时或超过 1 MiB 输出即停止，并清理该次查询启动的子进程。CLI 低于 1.1.11 时不发送 `/usage`，避免旧版本把它当成模型提示词。
+
+百分比统一显示**已用**（由 `remaining_fraction` 换算）。仅显示报告实际提供的窗口；如果账号只有周额度，不补造 5 小时额度。与独立 Claude 订阅的用量分开显示。
+
+四行共用一次用量查询。旧配置中的 `antigravity` 会在原位置展开成四行；原来关闭整个 provider 的配置也会保持四行关闭。
+
 ## LiteLLM 代理用量
 
 LiteLLM 虚拟 key 通常读不到 `/key/info`。刷新时打一次很便宜的 embeddings（失败再试短 chat），从响应头 `x-litellm-key-spend`、`x-litellm-key-max-budget` 读出 `$已用/$额度`。重置倒计时按 LiteLLM 的周规则（每周一 0:00）计算，时区可在设置里改，或用 `LLM_PROXY_TIMEZONE` / `llm_proxy_timezone`。没配 key 就不显示这一行。
@@ -140,8 +156,8 @@ LiteLLM 虚拟 key 通常读不到 `/key/info`。刷新时打一次很便宜的 
 ```json
 {
   "always_on_top": true,
-  "providers": ["codex", "codex-2", "grok", "claude", "llmproxy"],
-  "provider_order": ["codex", "codex-2", "grok", "claude", "llmproxy"],
+  "providers": ["codex", "codex-2", "grok", "claude", "llmproxy", "antigravity:gemini-weekly", "antigravity:gemini-5h", "antigravity:3p-weekly", "antigravity:3p-5h"],
+  "provider_order": ["codex", "codex-2", "grok", "claude", "llmproxy", "antigravity:gemini-weekly", "antigravity:gemini-5h", "antigravity:3p-weekly", "antigravity:3p-5h"],
   "disabled_providers": [],
   "refresh_seconds": 300,
   "display_mode": "panel",

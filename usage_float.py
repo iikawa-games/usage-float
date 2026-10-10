@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-usage-float — light translucent usage HUD for Claude / Codex / Grok / LLM Proxy.
+usage-float — light translucent usage HUD for Claude / Codex / Grok / Antigravity / LLM Proxy.
 
-  • One row per signed-in provider; a provider without credentials is hidden
+  • Usage windows per provider; providers without local credentials are hidden
+  • Antigravity uses the signed-in official agy CLI
   • Multiple Codex accounts, one per CODEX_HOME (~/.codex, ~/.codex-2, …)
   • Optional LiteLLM / OpenAI-compatible proxy spend (key headers)
   • Compact floating rows or a full-screen auxiliary-display instrument grid
@@ -14,12 +15,14 @@ usage-float — light translucent usage HUD for Claude / Codex / Grok / LLM Prox
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -27,6 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -44,7 +48,7 @@ APP_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", HOME / ".claude"))
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
 CODEX_HOME_2 = Path(os.environ.get("CODEX_HOME_2", HOME / ".codex-2"))
@@ -141,22 +145,33 @@ CODEX_ACCOUNT_BY_ID: dict[str, CodexAccount] = {
     account.provider_id: account for account in CODEX_ACCOUNTS
 }
 
-# Claude is one login but several rows, and each row is ordered and toggled
-# on its own in Settings. Every other provider is a single row under its id.
+# Claude and Antigravity share a login across several independently configurable rows.
 CLAUDE_DISPLAY_ITEMS: tuple[str, ...] = ("claude:fable", "claude:7d", "claude:5h")
 CLAUDE_WINDOW_ITEMS: dict[str, str] = {
     "seven_day": "claude:7d",
     "five_hour": "claude:5h",
 }
+ANTIGRAVITY_WINDOW_ITEMS: dict[str, str] = {
+    "gemini-weekly": "antigravity:gemini-weekly",
+    "gemini-5h": "antigravity:gemini-5h",
+    "3p-weekly": "antigravity:3p-weekly",
+    "3p-5h": "antigravity:3p-5h",
+}
+ANTIGRAVITY_DISPLAY_ITEMS: tuple[str, ...] = tuple(ANTIGRAVITY_WINDOW_ITEMS.values())
+PROVIDER_DISPLAY_ITEMS: dict[str, tuple[str, ...]] = {
+    "claude": CLAUDE_DISPLAY_ITEMS,
+    "antigravity": ANTIGRAVITY_DISPLAY_ITEMS,
+}
 
-# Display order. A provider only appears when it is actually signed in, so a
-# machine with one Codex account shows one Codex row.
+# Display order. A provider needs local credentials (Antigravity needs its CLI),
+# so a machine with one Codex account shows one Codex row.
 DEFAULT_PROVIDERS: tuple[str, ...] = (
     "codex",
     "codex-2",
     "grok",
     *CLAUDE_DISPLAY_ITEMS,
     "llmproxy",
+    *ANTIGRAVITY_DISPLAY_ITEMS,
 )
 PROVIDER_LABELS: dict[str, str] = {
     "codex": "Codex",
@@ -167,12 +182,18 @@ PROVIDER_LABELS: dict[str, str] = {
     "claude:7d": "claude 7d",
     "claude:5h": "claude 5h",
     "llmproxy": "LLM Proxy",
+    "antigravity": "Antigravity",
+    "antigravity:gemini-weekly": "agy gemini 7d",
+    "antigravity:gemini-5h": "agy gemini 5h",
+    "antigravity:3p-weekly": "agy claude 7d",
+    "antigravity:3p-5h": "agy claude 5h",
 }
 
 
 def provider_fetch_id(item: str) -> str:
     """The provider a display item is fetched from ("claude:5h" -> "claude")."""
-    return "claude" if item.startswith("claude:") else item
+    provider = item.partition(":")[0]
+    return provider if provider in PROVIDER_DISPLAY_ITEMS else item
 
 # SuperGrok / Grok Build credit window (same endpoint CC Switch / CodexBar use).
 # NOT cli-chat-proxy.grok.com/v1/billing — that returns 0/0 for subscription accounts.
@@ -1688,9 +1709,9 @@ def _unique_provider_ids(values: Any) -> list[str]:
     for item in values or []:
         if isinstance(item, str):
             pid = item.strip()
-            # Configs from before the per-row split name Claude once; it
-            # stands for all of its rows, in their default order.
-            for expanded in CLAUDE_DISPLAY_ITEMS if pid == "claude" else (pid,):
+            # Legacy group entries stand for all their rows, including an
+            # explicit disable of the entire group.
+            for expanded in PROVIDER_DISPLAY_ITEMS.get(pid, (pid,)):
                 if expanded and expanded not in out:
                     out.append(expanded)
     return out
@@ -3490,6 +3511,249 @@ def fetch_grok_usage() -> ProviderUsage:
 
 
 # ---------------------------------------------------------------------------
+# Antigravity (official CLI /usage; no model inference or credential extraction)
+# ---------------------------------------------------------------------------
+
+ANTIGRAVITY_MAX_OUTPUT = 1024 * 1024
+# agy refreshes its own OAuth token a few seconds after expiry. A /usage call
+# in that gap is a 401, so the retry waits long enough for the new token.
+ANTIGRAVITY_USAGE_RETRY_SECONDS = 8
+ANTIGRAVITY_BUCKETS = {
+    "gemini-weekly": "gemini 7d",
+    "gemini-5h": "gemini 5h",
+    "3p-weekly": "claude 7d",
+    "3p-5h": "claude 5h",
+}
+
+
+def find_antigravity_cli() -> Path | None:
+    """Also find the Windows installer location when agy is absent from PATH."""
+    override = os.environ.get("ANTIGRAVITY_CLI_PATH")
+    if override is not None:
+        candidate = Path(override) if override.strip() else None
+        return candidate.resolve() if candidate is not None and candidate.is_file() else None
+    binary = shutil.which("agy")
+    if binary:
+        return Path(binary)
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", HOME / "AppData" / "Local"))
+    for candidate in (local_app_data / "agy" / "bin" / "agy.exe", HOME / ".local" / "bin" / "agy"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _antigravity_windows_job() -> tuple[Any, Any]:
+    """Own CLI descendants, including plugin helpers, until this query ends."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [
+            ("process_time", ctypes.c_longlong), ("job_time", ctypes.c_longlong),
+            ("flags", wintypes.DWORD), ("min_working_set", ctypes.c_size_t),
+            ("max_working_set", ctypes.c_size_t), ("active_processes", wintypes.DWORD),
+            ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+            ("scheduling", wintypes.DWORD),
+        ]
+
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [
+            ("basic", BasicLimits), ("io_counters", ctypes.c_ulonglong * 6),
+            ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+            ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel.SetInformationJobObject.restype = wintypes.BOOL
+    kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.TerminateJobObject.restype = wintypes.BOOL
+    kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+    kernel.QueryInformationJobObject.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.CreateJobObjectW(None, None)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    limits = ExtendedLimits()
+    limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        error = ctypes.WinError(ctypes.get_last_error())
+        kernel.CloseHandle(handle)
+        raise error
+    return kernel, handle
+
+
+def _close_antigravity_windows_job(kernel: Any, job: Any) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class Accounting(ctypes.Structure):
+        _fields_ = [
+            ("times", ctypes.c_longlong * 4), ("page_faults", wintypes.DWORD),
+            ("total_processes", wintypes.DWORD), ("active_processes", wintypes.DWORD),
+            ("terminated_processes", wintypes.DWORD),
+        ]
+
+    try:
+        kernel.TerminateJobObject(job, 1)
+        # Termination is asynchronous. Wait before removing their working directory.
+        accounting = Accounting()
+        deadline = time.monotonic() + 5
+        while kernel.QueryInformationJobObject(job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None):
+            if accounting.active_processes == 0 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+    finally:
+        kernel.CloseHandle(job)
+
+
+def _run_antigravity_cli(binary: Path, arguments: list[str], *, timeout: float) -> str:
+    """Bound runtime/output and close this query's process tree on every exit."""
+    process = None
+    kernel = job = None
+    resources = ExitStack()
+    try:
+        if os.name == "nt":
+            kernel, job = _antigravity_windows_job()
+        # An empty directory avoids loading any project's instructions or MCP config.
+        directory_resource = tempfile.TemporaryDirectory(prefix="usage-float-agy-")
+        resources.callback(_cleanup_antigravity_directory, directory_resource)
+        directory = directory_resource.name
+        output = resources.enter_context(tempfile.TemporaryFile())
+        process = subprocess.Popen(
+            [str(binary), *arguments], cwd=directory,
+            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            start_new_session=os.name != "nt",
+        )
+        if kernel is not None and not kernel.AssignProcessToJobObject(job, int(process._handle)):
+            import ctypes
+            raise ctypes.WinError(ctypes.get_last_error())
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if os.fstat(output.fileno()).st_size > ANTIGRAVITY_MAX_OUTPUT:
+                raise ValueError("Antigravity usage response exceeds output limit")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(str(binary), timeout)
+            try:
+                process.wait(timeout=min(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+        if process.returncode != 0:
+            raise ValueError("Antigravity CLI query failed")
+        output.seek(0)
+        raw = output.read(ANTIGRAVITY_MAX_OUTPUT + 1)
+        if len(raw) > ANTIGRAVITY_MAX_OUTPUT:
+            raise ValueError("Antigravity usage response exceeds output limit")
+        return raw.decode("utf-8-sig")
+    finally:
+        if kernel is not None and job is not None:
+            _close_antigravity_windows_job(kernel, job)
+        elif process is not None and os.name != "nt":
+            import signal
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+        resources.close()
+
+
+def _cleanup_antigravity_directory(directory: tempfile.TemporaryDirectory) -> None:
+    # Windows can release a terminated child's cwd handle just after the job's
+    # active-process count reaches zero. Retry that short filesystem delay.
+    for attempt in range(50):
+        try:
+            directory.cleanup()
+            return
+        except PermissionError:
+            if attempt == 49:
+                raise
+            time.sleep(0.02)
+
+
+def _parse_antigravity_usage(payload: Any) -> list[UsageWindow]:
+    """Read quota buckets, never the prose response or inference token counts."""
+    if not isinstance(payload, dict) or payload.get("status") != "SUCCESS":
+        raise ValueError("Antigravity usage query did not succeed")
+    command = payload.get("command")
+    if not isinstance(command, dict) or command.get("name") != "usage":
+        raise ValueError("Antigravity did not return the usage command")
+    data = command.get("data")
+    groups = data.get("groups") if isinstance(data, dict) else None
+    if not isinstance(groups, list):
+        raise ValueError("Antigravity quota groups are missing")
+    buckets: dict[str, UsageWindow] = {}
+    for group in groups:
+        group_buckets = group.get("buckets") if isinstance(group, dict) else None
+        if not isinstance(group_buckets, list):
+            continue
+        for bucket in group_buckets:
+            if not isinstance(bucket, dict) or bucket.get("disabled") is True:
+                continue
+            bucket_id = bucket.get("id")
+            if not isinstance(bucket_id, str) or bucket_id not in ANTIGRAVITY_BUCKETS:
+                continue
+            fraction = bucket.get("remaining_fraction")
+            if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+                continue
+            if not math.isfinite(fraction) or not 0 <= fraction <= 1:
+                continue
+            reset = bucket.get("reset_time")
+            reset = reset if isinstance(reset, str) and parse_iso(reset) is not None else None
+            window = UsageWindow(bucket_id, ANTIGRAVITY_BUCKETS[bucket_id], (1 - fraction) * 100, reset)
+            if bucket_id not in buckets or window.used_pct > buckets[bucket_id].used_pct:
+                buckets[bucket_id] = window
+    if not buckets:
+        raise ValueError("Antigravity returned no supported quota buckets")
+    return [buckets[bucket_id] for bucket_id in ANTIGRAVITY_BUCKETS if bucket_id in buckets]
+
+
+def fetch_antigravity_usage() -> ProviderUsage:
+    try:
+        binary = find_antigravity_cli()
+        if binary is None:
+            raise ValueError("Antigravity CLI is not installed")
+        version = _run_antigravity_cli(binary, ["--version"], timeout=5)
+        match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version)
+        # Earlier CLIs can treat /usage as a model prompt instead of a command.
+        if match is None or tuple(map(int, match.groups())) < (1, 1, 11):
+            raise ValueError("Antigravity CLI 1.1.11 or later is required")
+    except Exception:
+        return ProviderUsage("antigravity", "agy", available=False, error="更新失败")
+
+    usage_args = ["-p", "/usage", "--output-format", "json"]
+    for attempt in range(2):
+        try:
+            raw = _run_antigravity_cli(binary, usage_args, timeout=60)
+            windows = _parse_antigravity_usage(json.loads(raw))
+            break
+        except Exception:
+            if attempt == 0:
+                time.sleep(ANTIGRAVITY_USAGE_RETRY_SECONDS)
+                continue
+            cached = cache_get_provider("antigravity")
+            if cached is not None:
+                return cached
+            return ProviderUsage("antigravity", "agy", available=False, error="更新失败")
+    result = ProviderUsage(
+        "antigravity", "agy", windows=windows,
+        fetched_at=datetime.now(timezone.utc).isoformat(),
+    )
+    cache_put_provider(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # LiteLLM / OpenAI-compatible proxy
 # ---------------------------------------------------------------------------
 
@@ -3921,10 +4185,10 @@ def fetch_llmproxy_usage() -> ProviderUsage:
 
 
 def provider_available(provider_id: str) -> bool:
-    """True when this machine actually holds a credential for the provider.
+    """True when local credentials (or the Antigravity-managed CLI) are present.
 
-    A provider that is not signed in is hidden outright rather than drawn as a
-    failed row, so an unused slot never occupies space in the strip.
+    Providers without local credentials are hidden. Antigravity manages its
+    secure login internally, so its installed CLI is checked by /usage instead.
     """
     provider_id = provider_fetch_id(provider_id)
     account = CODEX_ACCOUNT_BY_ID.get(provider_id)
@@ -3936,11 +4200,13 @@ def provider_available(provider_id: str) -> bool:
         return read_grok_token() is not None
     if provider_id == "llmproxy":
         return read_llm_proxy_credentials()[0] is not None
+    if provider_id == "antigravity":
+        return find_antigravity_cli() is not None
     return False
 
 
 def active_providers(configured: list[str] | None = None) -> list[str]:
-    """Configured providers narrowed to the ones that are actually signed in."""
+    """Configured providers with local credentials or an installed agy CLI."""
     selected = configured if configured is not None else list(DEFAULT_PROVIDERS)
     return [pid for pid in selected if provider_available(pid)]
 
@@ -3959,6 +4225,8 @@ def fetch_all(providers: list[str], *, force: bool = False) -> list[ProviderUsag
                 out.append(fetch_grok_usage())
             elif p == "llmproxy":
                 out.append(fetch_llmproxy_usage())
+            elif p == "antigravity":
+                out.append(fetch_antigravity_usage())
         except Exception:
             out.append(
                 ProviderUsage(
@@ -4013,8 +4281,10 @@ def reset_target_id(row: DisplayRow) -> str:
 def display_item(row: DisplayRow) -> str | None:
     """The Settings entry that shows or hides this row.
 
-    None for a Claude row that is not tied to one window (a failure line).
+    None for a shared provider row without a specific window (a failure line).
     """
+    if row.provider_id == "antigravity":
+        return ANTIGRAVITY_WINDOW_ITEMS.get(row.window_id)
     if row.provider_id != "claude":
         return row.provider_id
     if row.window_id.startswith("weekly_"):
@@ -4031,20 +4301,24 @@ def iter_display_rows(
     Claude (and any multi-window model) becomes one row per time window so the
     strip width stays stable instead of growing when 5h+7d are concatenated.
     With ``items`` (the enabled Settings entries, in order) rows are filtered
-    and sorted by them; a Claude failure line sits where its first row would.
+    and sorted by them; a shared failure line sits where its first enabled row would.
     """
     rows = _expand_display_rows(providers)
     if items is None:
         return rows
     rank = {item: index for index, item in enumerate(_unique_provider_ids(items))}
-    claude_ranks = [rank[item] for item in CLAUDE_DISPLAY_ITEMS if item in rank]
+    provider_ranks = {
+        provider: [rank[item] for item in display_items if item in rank]
+        for provider, display_items in PROVIDER_DISPLAY_ITEMS.items()
+    }
     ranked: list[tuple[int, DisplayRow]] = []
     for row in rows:
         item = display_item(row)
         if item is None:
-            if not claude_ranks:
+            positions = provider_ranks.get(row.provider_id, [])
+            if not positions:
                 continue
-            position = min(claude_ranks)
+            position = min(positions)
         elif item in rank:
             position = rank[item]
         else:
@@ -4087,7 +4361,7 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
                 # "claude 5h" / "claude 7d" / "fable 7d" (scoped rows omit provider prefix)
                 if w.id.startswith("weekly_"):
                     title = w.label  # e.g. "fable 7d" — no "claude"
-                elif multi:
+                elif multi or p.provider_id == "antigravity":
                     title = f"{name} {w.label}"
                 else:
                     title = name
@@ -6129,6 +6403,9 @@ def run_ui() -> None:
 
         reset_targets: list[tuple[tk.Misc, str]] = []
         for dr in iter_display_rows(providers, shown_items()):
+            compact_title = dr.title
+            if dr.provider_id == "antigravity":
+                compact_title = compact_title.replace("gemini", "gem")
             # pack order: right first (natural width, never clipped), then left expands
             row = tk.Frame(lines_frame, bg=ui_bg, height=row_h)
             row.pack(fill="x", anchor="w", pady=0)
@@ -6189,7 +6466,7 @@ def run_ui() -> None:
 
             left = tk.Label(
                 row,
-                text=dr.title,
+                text=compact_title,
                 fg=FG_LABEL,
                 bg=ui_bg,
                 font=font_main,
@@ -6207,10 +6484,10 @@ def run_ui() -> None:
                 max_left = max(40, content_w - rw - 4)
                 # Tk Label doesn't clip by width easily; use a fixed width in characters approx
                 # Measure and truncate with ellipsis if needed
-                title = dr.title
+                title = compact_title
                 while title and font_main.measure(title) > max_left:
                     title = title[:-1]
-                if title != dr.title and len(title) > 1:
+                if title != compact_title and len(title) > 1:
                     title = title[:-1] + "…"
                 left.configure(text=title)
             except Exception:
@@ -6793,7 +7070,7 @@ def run_ui() -> None:
         ).pack(fill="x", pady=(0, 2))
         tk.Label(
             providers_pad,
-            text="扫描本机登录态。勾选要显示的用量，按住行拖动可调整顺序。未登录的不会出现在面板上。",
+            text="勾选要显示的用量，按住行拖动可调整顺序。",
             fg=FG_MUTED,
             bg=BG,
             font=settings_font_small,
@@ -6876,13 +7153,13 @@ def run_ui() -> None:
                     values=(
                         "☑" if checked else "☐",
                         row.get("label") or provider_label(pid),
-                        "已登录" if row.get("available") else "未检测到",
+                        "已检测到" if row.get("available") else "未检测到",
                     ),
                     tags=(() if checked else ("disabled",)),
                 )
             available_count = sum(1 for row in scanned if row.get("available"))
             text = (
-                f"已登录 {available_count} / 共 {len(provider_order)}"
+                f"可用 {available_count} / 共 {len(provider_order)}"
                 f" · 显示 {len(enabled_providers)}"
             )
             if note:

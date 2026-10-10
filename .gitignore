@@ -11,6 +11,20 @@ _probe_*.py
 .usage-float/
 usage-cache.json
 
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+.secrets/
+auth.json
+.credentials.json
+credentials.json
+config.local.json
+*.pem
+*.key
+*.p12
+*.pfx
+
 # Captured private desktops
 docs/screenshots/_raw/
 docs/screenshots/_shot_root/

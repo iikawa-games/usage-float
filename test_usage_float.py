@@ -1,4 +1,6 @@
 import json
+import os
+import subprocess
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -879,11 +881,11 @@ class CodexMultiAccountTests(unittest.TestCase):
 
         self.assertEqual(
             config["providers"],
-            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy"],
+            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
         self.assertEqual(
             config["provider_order"],
-            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy"],
+            ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
         self.assertEqual(config["disabled_providers"], [])
 
@@ -898,6 +900,332 @@ class CodexMultiAccountTests(unittest.TestCase):
             consume_codex_reset_card("card-1", home=Path("/tmp/.codex-2"))
 
         self.assertEqual(seen["home"], Path("/tmp/.codex-2"))
+
+
+class AntigravityUsageTests(unittest.TestCase):
+    @staticmethod
+    def report(buckets=None):
+        if buckets is None:
+            buckets = [
+                {"id": "gemini-weekly", "remaining_fraction": 0.8, "reset_time": "2026-10-15T16:06:07Z"},
+                {"id": "gemini-5h", "remaining_fraction": 0.25, "reset_time": "2026-10-09T05:03:30Z"},
+                {"id": "3p-weekly", "remaining_fraction": 0.99, "reset_time": "2026-10-15T16:06:23Z"},
+                {"id": "3p-5h", "remaining_fraction": 1, "reset_time": "2026-10-09T06:55:50Z"},
+            ]
+        return {
+            "status": "SUCCESS", "num_turns": 0,
+            "command": {"name": "usage", "data": {"groups": [{"name": "quota", "buckets": buckets}]}},
+        }
+
+    def test_four_quotas_show_used_percent_and_real_reset_times(self) -> None:
+        windows = usage_float_module._parse_antigravity_usage(self.report())
+        self.assertEqual([w.label for w in windows], ["gemini 7d", "gemini 5h", "claude 7d", "claude 5h"])
+        for window, expected in zip(windows, [20, 75, 1, 0]):
+            self.assertAlmostEqual(window.used_pct, expected)
+        self.assertEqual(windows[0].resets_at, "2026-10-15T16:06:07Z")
+
+    def test_weekly_only_account_does_not_invent_five_hour_windows(self) -> None:
+        windows = usage_float_module._parse_antigravity_usage(self.report([
+            {"id": "gemini-weekly", "remaining_fraction": 0, "reset_time": "invalid"},
+        ]))
+        provider = ProviderUsage("antigravity", "agy", windows=windows)
+        rows = iter_display_rows([provider], ["antigravity"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].title, "agy gemini 7d")
+        self.assertEqual(rows[0].used_pct, 100)
+        self.assertIsNone(rows[0].resets_at)
+        self.assertFalse(row_opens_reset_ui(rows[0]))
+
+    def test_invalid_and_disabled_buckets_do_not_become_quotas(self) -> None:
+        for fraction in (None, True, "0.5", float("nan"), float("inf"), -0.1, 1.1):
+            with self.subTest(fraction=fraction), self.assertRaises(ValueError):
+                usage_float_module._parse_antigravity_usage(self.report([
+                    {"id": "gemini-5h", "remaining_fraction": fraction},
+                ]))
+        for bucket in (
+            {"id": "unknown", "remaining_fraction": 0.5},
+            {"id": "gemini-5h", "remaining_fraction": 0.5, "disabled": True},
+        ):
+            with self.subTest(bucket=bucket), self.assertRaises(ValueError):
+                usage_float_module._parse_antigravity_usage(self.report([bucket]))
+
+    def test_prose_or_inference_response_is_not_a_quota_report(self) -> None:
+        invalid = [None, {"status": "ERROR"}, {"status": "SUCCESS", "response": "99% remaining"}]
+        other_command = self.report()
+        other_command["command"]["name"] = "models"
+        invalid.append(other_command)
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                usage_float_module._parse_antigravity_usage(payload)
+
+    def test_installer_location_is_found_without_path_entry(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "agy" / "bin" / "agy.exe"
+            binary.parent.mkdir(parents=True)
+            binary.touch()
+            with patch.dict(os.environ, {"LOCALAPPDATA": directory}, clear=True), patch.object(
+                usage_float_module.shutil, "which", return_value=None
+            ), patch.object(usage_float_module, "HOME", root):
+                self.assertEqual(usage_float_module.find_antigravity_cli(), binary)
+                for override in ("", str(root / "missing.exe")):
+                    with patch.dict(os.environ, {"ANTIGRAVITY_CLI_PATH": override}):
+                        self.assertIsNone(usage_float_module.find_antigravity_cli())
+
+    def test_old_or_unknown_cli_never_receives_usage_as_a_prompt(self) -> None:
+        for version in ("1.1.10", "1.0.99", "unknown"):
+            with self.subTest(version=version), patch.object(
+                usage_float_module, "find_antigravity_cli", return_value=Path("agy.exe")
+            ), patch.object(usage_float_module, "_run_antigravity_cli", return_value=version) as run:
+                result = usage_float_module.fetch_antigravity_usage()
+                self.assertFalse(result.available)
+                self.assertEqual(result.error, "更新失败")
+                self.assertEqual([call.args[1] for call in run.call_args_list], [["--version"]])
+
+    def test_live_schema_fetch_is_cached_and_expands_in_settings_order(self) -> None:
+        with TemporaryDirectory() as directory, patch.object(
+            usage_float_module, "CACHE_PATH", Path(directory) / "cache.json"
+        ), patch.object(usage_float_module, "find_antigravity_cli", return_value=Path("agy.exe")), patch.object(
+            usage_float_module, "_run_antigravity_cli", side_effect=["1.3.2", json.dumps(self.report())]
+        ) as run:
+            fetched = usage_float_module.fetch_all(list(usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS))
+            self.assertEqual(len(fetched), 1)
+            self.assertEqual(run.call_count, 2)  # version + one quota query for all four rows
+            self.assertTrue(fetched[0].available)
+            self.assertIsNotNone(usage_float_module.cache_get_provider("antigravity"))
+            self.assertEqual(run.call_args_list[-1].args[1], ["-p", "/usage", "--output-format", "json"])
+        providers = [ProviderUsage("codex", "codex", windows=[UsageWindow("primary", "5h", 10)]), *fetched]
+        rows = iter_display_rows(providers, ["antigravity", "codex"])
+        self.assertEqual([row.title for row in rows], [
+            "agy gemini 7d", "agy gemini 5h", "agy claude 7d", "agy claude 5h", "codex",
+        ])
+        self.assertEqual(iter_display_rows(providers, ["codex"])[0].title, "codex")
+        self.assertEqual(len(iter_display_rows(providers, ["codex"])), 1)
+
+    def test_settings_scan_has_four_independent_entries(self) -> None:
+        items = list(usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS)
+        self.assertEqual(items, [
+            "antigravity:gemini-weekly", "antigravity:gemini-5h",
+            "antigravity:3p-weekly", "antigravity:3p-5h",
+        ])
+        with patch.object(usage_float_module, "find_antigravity_cli", return_value=Path("agy.exe")):
+            scanned = usage_float_module.scan_providers(items, items)
+            rows = [row for row in scanned if row["id"] in items]
+            self.assertTrue(all(row["available"] for row in rows))
+            self.assertEqual(usage_float_module.active_providers(items), items)
+        self.assertEqual([row["label"] for row in rows], [
+            "agy gemini 7d", "agy gemini 5h", "agy claude 7d", "agy claude 5h",
+        ])
+        with patch.object(usage_float_module, "find_antigravity_cli", return_value=None):
+            self.assertEqual(usage_float_module.active_providers(items), [])
+
+    def test_legacy_group_keeps_its_position_and_disabled_state(self) -> None:
+        items = list(usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS)
+        for disabled in ([], ["antigravity"]):
+            with self.subTest(disabled=disabled):
+                order, enabled, hidden = usage_float_module.resolve_provider_config(
+                    ["grok", "codex"] if disabled else ["grok", "antigravity", "codex"],
+                    disabled, ["grok", "antigravity", "codex"],
+                )
+                self.assertEqual(order[:6], ["grok", *items, "codex"])
+                self.assertNotIn("antigravity", order)
+                if disabled:
+                    self.assertTrue(all(item in hidden and item not in enabled for item in items))
+                else:
+                    self.assertTrue(all(item in enabled for item in items))
+
+    def test_individual_toggles_and_interleaved_order_survive_reload(self) -> None:
+        items = list(usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS)
+        enabled = [items[3], "codex", items[0]]
+        order = [*enabled, items[1], items[2], *[pid for pid in DEFAULT_PROVIDERS if pid not in ["codex", *items]]]
+        disabled = [pid for pid in order if pid not in enabled]
+        with TemporaryDirectory() as directory, patch.object(
+            usage_float_module, "CONFIG_PATH", Path(directory) / "config.json"
+        ):
+            usage_float_module.save_config({"providers": enabled, "provider_order": order, "disabled_providers": disabled})
+            config = usage_float_module.load_config()
+        self.assertEqual(config["providers"], enabled)
+        self.assertEqual(config["provider_order"], order)
+        self.assertEqual(config["disabled_providers"], disabled)
+        provider = ProviderUsage("antigravity", "agy", windows=usage_float_module._parse_antigravity_usage(self.report()))
+        codex = ProviderUsage("codex", "codex", windows=[UsageWindow("primary", "5h", 10)])
+        rows = iter_display_rows([codex, provider], config["providers"])
+        self.assertEqual([row.title for row in rows], ["agy claude 5h", "codex", "agy gemini 7d"])
+        moved = usage_float_module.move_provider(config["providers"], items[0], items[3])
+        self.assertEqual([row.title for row in iter_display_rows([codex, provider], moved)], [
+            "agy gemini 7d", "agy claude 5h", "codex",
+        ])
+
+    def test_shared_failure_uses_first_enabled_antigravity_row(self) -> None:
+        failed = ProviderUsage("antigravity", "agy", available=False, error="更新失败")
+        codex = ProviderUsage("codex", "codex", windows=[UsageWindow("primary", "5h", 10)])
+        rows = iter_display_rows([failed, codex], ["codex", "antigravity:3p-5h", "antigravity:gemini-weekly"])
+        self.assertEqual([row.title for row in rows], ["codex", "agy"])
+        self.assertTrue(rows[1].failed)
+        self.assertEqual(iter_display_rows([failed], ["codex"]), [])
+
+    def test_timeout_and_login_failure_show_failure_instead_of_zero_usage(self) -> None:
+        for error in (subprocess.TimeoutExpired("agy", 60), ValueError("login required")):
+            with self.subTest(error=error), patch.object(
+                usage_float_module, "find_antigravity_cli", return_value=Path("agy.exe")
+            ), patch.object(usage_float_module, "_run_antigravity_cli", side_effect=error):
+                result = usage_float_module.fetch_antigravity_usage()
+                rows = iter_display_rows([result], ["antigravity"])
+                self.assertTrue(rows[0].failed)
+                self.assertIsNone(rows[0].used_pct)
+
+    def test_usage_failure_retries_once_and_keeps_the_second_result(self) -> None:
+        with TemporaryDirectory() as directory, patch.object(
+            usage_float_module, "CACHE_PATH", Path(directory) / "cache.json"
+        ), patch.object(
+            usage_float_module, "ANTIGRAVITY_USAGE_RETRY_SECONDS", 0
+        ), patch.object(
+            usage_float_module, "find_antigravity_cli", return_value=Path("agy.exe")
+        ), patch.object(
+            usage_float_module, "_run_antigravity_cli", side_effect=[
+                "1.3.2", ValueError("Antigravity CLI query failed"), json.dumps(self.report()),
+            ]
+        ) as run, patch.object(usage_float_module.time, "sleep") as sleep:
+            result = usage_float_module.fetch_antigravity_usage()
+            cached = usage_float_module.cache_get_provider("antigravity")
+
+        self.assertTrue(result.available)
+        self.assertFalse(result.stale)
+        self.assertEqual([window.label for window in result.windows], [
+            "gemini 7d", "gemini 5h", "claude 7d", "claude 5h",
+        ])
+        self.assertIsNotNone(cached)
+        self.assertEqual([call.args[1] for call in run.call_args_list], [
+            ["--version"],
+            ["-p", "/usage", "--output-format", "json"],
+            ["-p", "/usage", "--output-format", "json"],
+        ])
+        sleep.assert_called_once_with(0)
+
+    def test_repeated_usage_failure_shows_the_cached_read(self) -> None:
+        with TemporaryDirectory() as directory, patch.object(
+            usage_float_module, "CACHE_PATH", Path(directory) / "cache.json"
+        ), patch.object(
+            usage_float_module, "ANTIGRAVITY_USAGE_RETRY_SECONDS", 0
+        ), patch.object(
+            usage_float_module, "find_antigravity_cli", return_value=Path("agy.exe")
+        ), patch.object(usage_float_module.time, "sleep") as sleep:
+            good = ProviderUsage(
+                "antigravity", "agy",
+                windows=usage_float_module._parse_antigravity_usage(self.report()),
+                fetched_at=datetime.now(timezone.utc).isoformat(),
+            )
+            usage_float_module.cache_put_provider(good)
+            with patch.object(
+                usage_float_module, "_run_antigravity_cli", side_effect=[
+                    "1.3.2", ValueError("Antigravity CLI query failed"),
+                    ValueError("Antigravity CLI query failed"),
+                ]
+            ) as run:
+                result = usage_float_module.fetch_antigravity_usage()
+
+        self.assertTrue(result.available)
+        self.assertTrue(result.stale)
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            [(window.id, window.used_pct) for window in result.windows],
+            [(window.id, window.used_pct) for window in good.windows],
+        )
+        self.assertEqual(run.call_count, 3)
+        sleep.assert_called_once_with(0)
+
+    def test_repeated_usage_failure_without_cache_stays_a_failure(self) -> None:
+        with TemporaryDirectory() as directory, patch.object(
+            usage_float_module, "CACHE_PATH", Path(directory) / "cache.json"
+        ), patch.object(
+            usage_float_module, "ANTIGRAVITY_USAGE_RETRY_SECONDS", 0
+        ), patch.object(
+            usage_float_module, "find_antigravity_cli", return_value=Path("agy.exe")
+        ), patch.object(
+            usage_float_module, "_run_antigravity_cli", side_effect=[
+                "1.3.2", ValueError("Antigravity CLI query failed"),
+                ValueError("Antigravity CLI query failed"),
+            ]
+        ) as run, patch.object(usage_float_module.time, "sleep") as sleep:
+            result = usage_float_module.fetch_antigravity_usage()
+
+        self.assertFalse(result.available)
+        self.assertEqual(result.error, "更新失败")
+        self.assertFalse(result.stale)
+        self.assertEqual(result.windows, [])
+        self.assertEqual(run.call_count, 3)
+        sleep.assert_called_once_with(0)
+        rows = iter_display_rows([result], ["antigravity"])
+        self.assertTrue(rows[0].failed)
+        self.assertEqual(rows[0].summary, "更新失败")
+
+    def test_missing_cli_does_not_retry(self) -> None:
+        with TemporaryDirectory() as directory, patch.object(
+            usage_float_module, "CACHE_PATH", Path(directory) / "cache.json"
+        ), patch.object(
+            usage_float_module, "find_antigravity_cli", return_value=None
+        ), patch.object(usage_float_module, "_run_antigravity_cli") as run, patch.object(
+            usage_float_module.time, "sleep"
+        ) as sleep:
+            usage_float_module.cache_put_provider(ProviderUsage(
+                "antigravity", "agy",
+                windows=usage_float_module._parse_antigravity_usage(self.report()),
+                fetched_at=datetime.now(timezone.utc).isoformat(),
+            ))
+            result = usage_float_module.fetch_antigravity_usage()
+
+        self.assertFalse(result.available)
+        self.assertEqual(result.error, "更新失败")
+        self.assertFalse(result.stale)
+        run.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_runner_caps_output(self) -> None:
+        with patch.object(usage_float_module, "ANTIGRAVITY_MAX_OUTPUT", 64), self.assertRaises(ValueError):
+            usage_float_module._run_antigravity_cli(Path(sys.executable), ["-c", "print('x' * 128)"], timeout=5)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree cleanup")
+    def test_runner_reaps_plugin_children_on_success_and_timeout(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        code = (
+            "import subprocess,sys,time; from pathlib import Path; "
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+            "Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(float(sys.argv[2]))"
+        )
+        for delay in (0.2, 60):
+            with self.subTest(delay=delay), TemporaryDirectory() as directory:
+                pid_file = Path(directory) / "child.pid"
+                try:
+                    if delay == 60:
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            usage_float_module._run_antigravity_cli(
+                                Path(sys.executable), ["-c", code, str(pid_file), str(delay)], timeout=2
+                            )
+                    else:
+                        usage_float_module._run_antigravity_cli(
+                            Path(sys.executable), ["-c", code, str(pid_file), str(delay)], timeout=5
+                        )
+                    self.assertTrue(pid_file.exists(), "Child process was not launched")
+                finally:
+                    if pid_file.exists():
+                        handle = kernel.OpenProcess(0x100001, False, int(pid_file.read_text()))
+                        if handle:
+                            try:
+                                stopped = kernel.WaitForSingleObject(handle, 2000) == 0
+                                if not stopped:
+                                    kernel.TerminateProcess(handle, 1)
+                                    kernel.WaitForSingleObject(handle, 2000)
+                                self.assertTrue(stopped, "CLI left its child running")
+                            finally:
+                                kernel.CloseHandle(handle)
 
 
 class LlmProxyUsageTests(unittest.TestCase):
@@ -1119,8 +1447,8 @@ class ProviderConfigTests(unittest.TestCase):
             [],
             ["claude", "codex", "grok"],
         )
-        self.assertEqual(order, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy"])
-        self.assertEqual(enabled, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy"])
+        self.assertEqual(order, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(enabled, ["claude:fable", "claude:7d", "claude:5h", "codex", "codex-2", "grok", "llmproxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
         self.assertEqual(disabled, [])
 
     def test_disabled_providers_keep_order_and_stay_hidden(self) -> None:
@@ -1129,8 +1457,8 @@ class ProviderConfigTests(unittest.TestCase):
             ["claude"],
             ["grok", "codex", "claude"],
         )
-        self.assertEqual(order, ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "llmproxy"])
-        self.assertEqual(enabled, ["grok", "codex", "codex-2", "llmproxy"])
+        self.assertEqual(order, ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "llmproxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
+        self.assertEqual(enabled, ["grok", "codex", "codex-2", "llmproxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
         self.assertEqual(disabled, ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_unchecking_every_row_stays_empty(self) -> None:
@@ -1175,9 +1503,9 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             config["provider_order"],
-            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "llmproxy"],
+            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "llmproxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
-        self.assertEqual(config["providers"], ["grok", "codex", "codex-2", "llmproxy"])
+        self.assertEqual(config["providers"], ["grok", "codex", "codex-2", "llmproxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS])
         self.assertEqual(config["disabled_providers"], ["claude:fable", "claude:7d", "claude:5h"])
 
     def test_scan_providers_reports_login_state_in_saved_order(self) -> None:
@@ -1202,7 +1530,7 @@ class ProviderConfigTests(unittest.TestCase):
 
         self.assertEqual(
             [row["id"] for row in rows],
-            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "llmproxy"],
+            ["grok", "codex", "codex-2", "claude:fable", "claude:7d", "claude:5h", "llmproxy", *usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS],
         )
         self.assertEqual(rows[0]["label"], "Grok")
         self.assertEqual(rows[3]["label"], "fable 7d")
