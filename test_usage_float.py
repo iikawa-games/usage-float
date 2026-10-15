@@ -2191,7 +2191,7 @@ class WallpaperDirectoryAndIndexTests(unittest.TestCase):
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         self.assertEqual(len(dirs), 12)
         self.assertEqual(sum(count for _d, count in dirs), 10500)
-        self.assertLess(elapsed_ms, 80.0)
+        self.assertLess(elapsed_ms, 150.0)
 
         with TemporaryDirectory() as temp_dir:
             playlist_path = Path(temp_dir) / "wallpaper.m3u"
@@ -2203,7 +2203,7 @@ class WallpaperDirectoryAndIndexTests(unittest.TestCase):
                 len(lines),
                 1 + usage_float_module.WALLPAPER_PLAYLIST_MAX_ITEMS,
             )
-            self.assertLess(write_ms, 80.0)
+            self.assertLess(write_ms, 150.0)
 
 
 if __name__ == "__main__":

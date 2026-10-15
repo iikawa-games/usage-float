@@ -3188,13 +3188,16 @@ def claude_authorized_json(
     return call(oauth["accessToken"])
 
 
-def claude_organization_uuid() -> str | None:
+def claude_organization_uuid(provider_id: str = "claude") -> str | None:
     """The OAuth organization the claim is filed under.
 
     Claude Code records it in .claude.json at login; the profile endpoint is
     the fallback when that file is somewhere unexpected.
     """
-    for path in (CLAUDE_HOME / ".claude.json", HOME / ".claude.json"):
+    is_second = provider_id == "claude-2"
+    home = CLAUDE_HOME_2 if is_second else None
+    paths = (CLAUDE_HOME_2 / ".claude.json",) if is_second else (CLAUDE_HOME / ".claude.json", HOME / ".claude.json")
+    for path in paths:
         try:
             if not path.exists():
                 continue
@@ -3204,7 +3207,11 @@ def claude_organization_uuid() -> str | None:
                 return found.strip()
         except Exception:
             continue
-    status, payload = claude_authorized_json(CLAUDE_PROFILE_URL)
+    status, payload = (
+        claude_authorized_json(CLAUDE_PROFILE_URL, home=home)
+        if home is not None
+        else claude_authorized_json(CLAUDE_PROFILE_URL)
+    )
     if status == 200 and isinstance(payload, dict):
         found = str((payload.get("organization") or {}).get("uuid") or "").strip()
         if found:
@@ -3231,24 +3238,28 @@ CLAUDE_RESET_RESULT_TEXT = {
 }
 
 
-def claim_claude_reset(grant_id: str, *, request_id: str) -> ClaudeResetClaim:
+def claim_claude_reset(
+    grant_id: str, *, request_id: str, provider_id: str = "claude"
+) -> ClaudeResetClaim:
     """Spend one /limit-reset grant. Only call this after the user confirms."""
     if not CLAUDE_RESET_GRANT_ID_RE.match(grant_id or "") or not (
         CLAUDE_RESET_REQUEST_ID_RE.match(request_id or "")
     ):
         return ClaudeResetClaim(False, "重置数据格式异常，未发送请求。")
-    org = claude_organization_uuid()
+    home = CLAUDE_HOME_2 if provider_id == "claude-2" else None
+    org = claude_organization_uuid(provider_id) if provider_id == "claude-2" else claude_organization_uuid()
     if not org:
         return ClaudeResetClaim(False, "找不到 Claude 组织信息，请在 Claude Code 里重新登录。")
-    status, payload = claude_authorized_json(
-        CLAUDE_RESET_CLAIM_URL.format(org=urllib.parse.quote(org, safe="")),
-        method="POST",
-        body={
-            "program": CLAUDE_RESET_PROGRAM,
-            "grant_id": grant_id,
-            "request_id": request_id,
-        },
-        timeout=25.0,
+    url = CLAUDE_RESET_CLAIM_URL.format(org=urllib.parse.quote(org, safe=""))
+    body = {
+        "program": CLAUDE_RESET_PROGRAM,
+        "grant_id": grant_id,
+        "request_id": request_id,
+    }
+    status, payload = (
+        claude_authorized_json(url, method="POST", body=body, timeout=25.0, home=home)
+        if home is not None
+        else claude_authorized_json(url, method="POST", body=body, timeout=25.0)
     )
     if status == 0 and payload is None:
         return ClaudeResetClaim(False, "未找到可用的 Claude 登录凭证")
@@ -3336,9 +3347,16 @@ def parse_claude_session_reset(block: Any) -> ClaudeSessionReset:
     )
 
 
-def fetch_claude_session_reset() -> tuple[ClaudeSessionReset | None, str | None]:
+def fetch_claude_session_reset(
+    provider_id: str = "claude",
+) -> tuple[ClaudeSessionReset | None, str | None]:
     """Read the 5h session reset. Only the 5h dialog calls this, on demand."""
-    status, payload = claude_authorized_json(CLAUDE_USAGE_AT_WALL_URL)
+    home = CLAUDE_HOME_2 if provider_id == "claude-2" else None
+    status, payload = (
+        claude_authorized_json(CLAUDE_USAGE_AT_WALL_URL, home=home)
+        if home is not None
+        else claude_authorized_json(CLAUDE_USAGE_AT_WALL_URL)
+    )
     if status == 0 and payload is None:
         return None, "未找到可用的 Claude 登录凭证"
     if status == 429:
@@ -3356,20 +3374,22 @@ CLAUDE_SESSION_RESULT_TEXT = {
 }
 
 
-def claim_claude_session_reset() -> ClaudeResetClaim:
+def claim_claude_session_reset(provider_id: str = "claude") -> ClaudeResetClaim:
     """Spend this week's 5h session reset. Only call after the user confirms.
 
     The CLI sends no request id for this program; the weekly quota itself is
     what stops a retried click from spending twice ("already_used").
     """
-    org = claude_organization_uuid()
+    home = CLAUDE_HOME_2 if provider_id == "claude-2" else None
+    org = claude_organization_uuid(provider_id) if provider_id == "claude-2" else claude_organization_uuid()
     if not org:
         return ClaudeResetClaim(False, "找不到 Claude 组织信息，请在 Claude Code 里重新登录。")
-    status, payload = claude_authorized_json(
-        CLAUDE_RESET_CLAIM_URL.format(org=urllib.parse.quote(org, safe="")),
-        method="POST",
-        body={"program": CLAUDE_SESSION_RESET_PROGRAM},
-        timeout=25.0,
+    url = CLAUDE_RESET_CLAIM_URL.format(org=urllib.parse.quote(org, safe=""))
+    body = {"program": CLAUDE_SESSION_RESET_PROGRAM}
+    status, payload = (
+        claude_authorized_json(url, method="POST", body=body, timeout=25.0, home=home)
+        if home is not None
+        else claude_authorized_json(url, method="POST", body=body, timeout=25.0)
     )
     if status == 0 and payload is None:
         return ClaudeResetClaim(False, "未找到可用的 Claude 登录凭证")
@@ -4898,12 +4918,12 @@ def row_opens_reset_ui(row: DisplayRow) -> bool:
     """
     if row.provider_id in CODEX_ACCOUNT_BY_ID:
         return True
-    return row.provider_id == "claude" and row.window_id in ("five_hour", "seven_day")
+    return row.provider_id in ("claude", "claude-2") and row.window_id in ("five_hour", "seven_day")
 
 
 def reset_target_id(row: DisplayRow) -> str:
     """What a click on this row's number opens: a Codex account or a Claude row."""
-    if row.provider_id == "claude":
+    if row.provider_id in ("claude", "claude-2"):
         return display_item(row) or row.provider_id
     return row.provider_id
 
@@ -5833,10 +5853,12 @@ def run_ui() -> None:
         "refresh_hover": False,
         "reset_cards_win": None,
         "claude_reset_win": None,
+        "claude_reset_account": None,
         "claude_session_win": None,
+        "claude_session_account": None,
         "claude_session_busy": False,
         "claude_reset_busy": False,
-        # (grant_id, request_id) of a claim whose outcome never arrived.
+        # (account_id, grant_id, request_id) of a claim whose outcome never arrived.
         "claude_reset_unsettled": None,
         "reset_cards_account": None,
         "reset_cards_busy": False,
@@ -6819,10 +6841,10 @@ def run_ui() -> None:
 
     def open_reset_ui(provider_id: str) -> None:
         """Send the click to whichever reset UI this provider has."""
-        if provider_id == "claude:7d":
-            open_claude_reset_info()
-        elif provider_id == "claude:5h":
-            open_claude_session_reset()
+        if provider_id in ("claude:7d", "claude-2:7d"):
+            open_claude_reset_info(provider_id.split(":", 1)[0])
+        elif provider_id in ("claude:5h", "claude-2:5h"):
+            open_claude_session_reset(provider_id.split(":", 1)[0])
         elif provider_id in CODEX_ACCOUNT_BY_ID:
             open_codex_reset_cards(provider_id)
 
@@ -10441,17 +10463,20 @@ def run_ui() -> None:
         win.lift()
         win.focus_set()
 
-    def open_claude_reset_info() -> None:
+    def open_claude_reset_info(account_id: str = "claude") -> None:
         """Claude's /limit-reset grants, laid out like the Codex card dialog."""
+        account_id = "claude-2" if account_id == "claude-2" else "claude"
         existing = state.get("claude_reset_win")
         if existing is not None:
             try:
                 if existing.winfo_exists():
-                    place_settings_on_primary(existing)
-                    existing.deiconify()
-                    existing.lift()
-                    existing.focus_set()
-                    return
+                    if state.get("claude_reset_account") == account_id:
+                        place_settings_on_primary(existing)
+                        existing.deiconify()
+                        existing.lift()
+                        existing.focus_set()
+                        return
+                    existing.destroy()
             except Exception:
                 pass
 
@@ -10459,8 +10484,9 @@ def run_ui() -> None:
         # Same reason as the settings dialog: map once, at the final position.
         win.withdraw()
         state["claude_reset_win"] = win
+        state["claude_reset_account"] = account_id
         state["claude_reset_busy"] = False
-        win.title("claude 用量重置")
+        win.title(f"{account_id} 用量重置")
         win.configure(bg=BG)
         win.resizable(False, False)
 
@@ -10473,7 +10499,7 @@ def run_ui() -> None:
 
         tk.Label(
             shell,
-            text="选择一次重置，立即重置 claude 的用量窗口。",
+            text=f"选择一次重置，立即重置 {account_id} 的用量窗口。",
             fg=FG,
             bg=BG,
             font=dialog_font,
@@ -10511,6 +10537,7 @@ def run_ui() -> None:
 
         def close() -> None:
             state["claude_reset_win"] = None
+            state["claude_reset_account"] = None
             state["claude_reset_busy"] = False
             try:
                 win.destroy()
@@ -10556,7 +10583,7 @@ def run_ui() -> None:
 
         def claude_provider() -> ProviderUsage | None:
             for provider in state.get("providers") or []:
-                if provider.provider_id == "claude":
+                if provider.provider_id == account_id:
                     return provider
             return None
 
@@ -10636,7 +10663,11 @@ def run_ui() -> None:
 
             def work() -> None:
                 try:
-                    fresh: ProviderUsage | None = fetch_claude_usage(force=True)
+                    fresh: ProviderUsage | None = (
+                        fetch_claude_usage(force=True, provider_id=account_id)
+                        if account_id == "claude-2"
+                        else fetch_claude_usage(force=True)
+                    )
                 except Exception:
                     _log_exception("claude reset status")
                     fresh = None
@@ -10649,7 +10680,7 @@ def run_ui() -> None:
                     # Share the fresh read with the HUD so its 5h number and
                     # reset mark agree with what the dialog lists.
                     state["providers"] = [
-                        fresh if p.provider_id == "claude" else p
+                        fresh if p.provider_id == account_id else p
                         for p in state.get("providers") or []
                     ]
                     render(relayout=not state.get("panel_active"))
@@ -10687,7 +10718,7 @@ def run_ui() -> None:
             windows = window_names(grant.clears) or "用量窗口"
             if not messagebox.askokcancel(
                 "使用用量重置",
-                f"使用后这次重置立即作废，claude 的{windows}会重新开始计算。\n"
+                f"使用后这次重置立即作废，{account_id} 的{windows}会重新开始计算。\n"
                 "确定要使用吗？",
                 parent=win,
             ):
@@ -10695,18 +10726,22 @@ def run_ui() -> None:
             # Resend the id of an attempt whose outcome never arrived, so the
             # server dedupes it rather than spending a second reset.
             unsettled = state.get("claude_reset_unsettled")
-            if unsettled and unsettled[0] == grant_id:
-                request_id = unsettled[1]
+            if unsettled and len(unsettled) == 3 and unsettled[0] == account_id and unsettled[1] == grant_id:
+                request_id = unsettled[2]
             else:
                 request_id = str(uuid.uuid4())
-                state["claude_reset_unsettled"] = (grant_id, request_id)
+                state["claude_reset_unsettled"] = (account_id, grant_id, request_id)
             state["claude_reset_busy"] = True
             sync_buttons()
             status_label.configure(text="正在使用重置…", fg=FG_MUTED)
 
             def work() -> None:
                 try:
-                    claim = claim_claude_reset(grant_id, request_id=request_id)
+                    claim = (
+                        claim_claude_reset(grant_id, request_id=request_id, provider_id=account_id)
+                        if account_id == "claude-2"
+                        else claim_claude_reset(grant_id, request_id=request_id)
+                    )
                 except Exception:
                     _log_exception("claude reset claim")
                     claim = ClaudeResetClaim(False, "使用失败", settled=False)
@@ -10766,17 +10801,20 @@ def run_ui() -> None:
         if not cached:
             load_grants()
 
-    def open_claude_session_reset() -> None:
+    def open_claude_session_reset(account_id: str = "claude") -> None:
         """Claude's weekly 5h session reset, laid out like the Codex card dialog."""
+        account_id = "claude-2" if account_id == "claude-2" else "claude"
         existing = state.get("claude_session_win")
         if existing is not None:
             try:
                 if existing.winfo_exists():
-                    place_settings_on_primary(existing)
-                    existing.deiconify()
-                    existing.lift()
-                    existing.focus_set()
-                    return
+                    if state.get("claude_session_account") == account_id:
+                        place_settings_on_primary(existing)
+                        existing.deiconify()
+                        existing.lift()
+                        existing.focus_set()
+                        return
+                    existing.destroy()
             except Exception:
                 pass
 
@@ -10784,8 +10822,9 @@ def run_ui() -> None:
         # Same reason as the settings dialog: map once, at the final position.
         win.withdraw()
         state["claude_session_win"] = win
+        state["claude_session_account"] = account_id
         state["claude_session_busy"] = False
-        win.title("claude 5 小时重置")
+        win.title(f"{account_id} 5 小时重置")
         win.configure(bg=BG)
         win.resizable(False, False)
 
@@ -10798,7 +10837,7 @@ def run_ui() -> None:
 
         tk.Label(
             shell,
-            text="选择一次重置，立即重置 claude 的 5 小时会话。",
+            text=f"选择一次重置，立即重置 {account_id} 的 5 小时会话。",
             fg=FG,
             bg=BG,
             font=dialog_font,
@@ -10835,6 +10874,7 @@ def run_ui() -> None:
 
         def close() -> None:
             state["claude_session_win"] = None
+            state["claude_session_account"] = None
             state["claude_session_busy"] = False
             try:
                 win.destroy()
@@ -10931,7 +10971,11 @@ def run_ui() -> None:
 
             def work() -> None:
                 try:
-                    reset, error = fetch_claude_session_reset()
+                    reset, error = (
+                        fetch_claude_session_reset(account_id)
+                        if account_id == "claude-2"
+                        else fetch_claude_session_reset()
+                    )
                 except Exception:
                     _log_exception("claude session reset status")
                     reset, error = None, "读取重置额度失败"
@@ -10965,7 +11009,7 @@ def run_ui() -> None:
 
             if not messagebox.askokcancel(
                 "使用 5 小时重置",
-                "使用后本周的 5 小时重置立即作废，claude 的 5 小时会话会重新开始计算。\n"
+                f"使用后本周的 5 小时重置立即作废，{account_id} 的 5 小时会话会重新开始计算。\n"
                 "确定要使用吗？",
                 parent=win,
             ):
@@ -10976,7 +11020,11 @@ def run_ui() -> None:
 
             def work() -> None:
                 try:
-                    claim = claim_claude_session_reset()
+                    claim = (
+                        claim_claude_session_reset(account_id)
+                        if account_id == "claude-2"
+                        else claim_claude_session_reset()
+                    )
                 except Exception:
                     _log_exception("claude session reset claim")
                     claim = ClaudeResetClaim(False, "使用失败", settled=False)
