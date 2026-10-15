@@ -6246,6 +6246,7 @@ def run_ui() -> None:
         folders_to_scan: list[str] | tuple[str, ...],
         *,
         force_rescan: bool = False,
+        notify_start: bool = True,
         on_done: Callable[[], None] | None = None,
     ) -> None:
         normalized = _normalize_wallpaper_folders(folders_to_scan)
@@ -6264,12 +6265,13 @@ def run_ui() -> None:
             if on_done is not None:
                 on_done()
             return
-        cb = state.get("wallpaper_scan_callback")
-        if callable(cb):
-            try:
-                cb()
-            except Exception:
-                pass
+        if notify_start:
+            cb = state.get("wallpaper_scan_callback")
+            if callable(cb):
+                try:
+                    cb()
+                except Exception:
+                    pass
 
         def _worker() -> None:
             for key, folder in pending:
@@ -6599,6 +6601,31 @@ def run_ui() -> None:
 
     apply_mode_surface()
 
+    def _configure_font_if_changed(font_obj: tkfont.Font, **kwargs: Any) -> bool:
+        """Only call font.configure when an option actually changed.
+
+        In Tcl/Tk, `font configure` unconditionally fires `Tk_WorldChanged()`
+        across every Toplevel in the interpreter, causing open dialogs (such as
+        Settings) to recompute geometry and flicker even when the font size is
+        identical.
+        """
+        updates: dict[str, Any] = {}
+        for key, value in kwargs.items():
+            try:
+                current = font_obj.cget(key)
+            except Exception:
+                updates[key] = value
+                continue
+            if str(current) != str(value):
+                updates[key] = value
+        if not updates:
+            return False
+        try:
+            font_obj.configure(**updates)
+            return True
+        except Exception:
+            return False
+
     def metrics_for_font(size: int) -> tuple[int, int]:
         """(row_height, right_col_min) from real font metrics — avoids under-height clip."""
         try:
@@ -6611,12 +6638,9 @@ def run_ui() -> None:
     def apply_font_size(size: int, *, persist: bool = True, relayout: bool = True) -> None:
         size = max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, int(size)))
         state["font_size"] = size
-        try:
-            font_main.configure(size=size)
-            font_footer.configure(size=max(FONT_SIZE_MIN, size - 1))
-            font_grip.configure(size=max(8, size - 2))
-        except Exception:
-            pass
+        _configure_font_if_changed(font_main, size=size)
+        _configure_font_if_changed(font_footer, size=max(FONT_SIZE_MIN, size - 1))
+        _configure_font_if_changed(font_grip, size=max(8, size - 2))
         # Measure after updating the named font. Measuring first made the live
         # preview use the previous slider value until the next event/close.
         rh, rcw = metrics_for_font(size)
@@ -6946,22 +6970,20 @@ def run_ui() -> None:
         width = panel.width if panel is not None else max(640, root.winfo_width())
         height = panel.height if panel is not None else max(480, root.winfo_height())
         rows = iter_display_rows(providers, shown_items()) if providers else []
-        metrics = _panel_metrics(
-            width,
-            height,
-            max(5, len(rows)),
-            panel.dpi_y if panel is not None else 96,
-        )
-        body.configure(
-            padx=metrics.outer_padding,
-            pady=max(12, metrics.outer_padding - 4),
-        )
-        font_panel_title.configure(size=metrics.title_points)
-        font_panel_value.configure(size=metrics.value_points)
-        font_panel_meta.configure(size=metrics.meta_points)
-        font_panel_footer.configure(size=metrics.footer_points)
+        dpi_y = panel.dpi_y if panel is not None else 96
 
         if not rows:
+            metrics = _panel_metrics(width, height, 5, dpi_y)
+            target_pady = max(12, metrics.outer_padding - 4)
+            if (
+                int(body.cget("padx") or 0) != metrics.outer_padding
+                or int(body.cget("pady") or 0) != target_pady
+            ):
+                body.configure(padx=metrics.outer_padding, pady=target_pady)
+            _configure_font_if_changed(font_panel_title, size=metrics.title_points)
+            _configure_font_if_changed(font_panel_value, size=metrics.value_points)
+            _configure_font_if_changed(font_panel_meta, size=metrics.meta_points)
+            _configure_font_if_changed(font_panel_footer, size=metrics.footer_points)
             message = "正在读取用量…" if state["refreshing"] else "暂无用量数据"
             empty = state.get("panel_empty_label")
             try:
@@ -6988,6 +7010,7 @@ def run_ui() -> None:
 
         columns, grid_rows = _panel_grid_shape(max(4, len(rows)), width, height)
         col_positions: list[tuple[int, int]] | None = None
+        metric_row_count = max(5, len(rows))
         raw_cols = cfg.get("provider_columns")
         if columns == 2 and isinstance(raw_cols, (list, tuple)) and len(raw_cols) >= 2:
             left_ids = set(_unique_provider_ids(raw_cols[0]))
@@ -7013,26 +7036,25 @@ def run_ui() -> None:
                         col1_indices.append(idx)
             if col0_indices and col1_indices:
                 grid_rows = max(len(col0_indices), len(col1_indices), 1)
-                metrics = _panel_metrics(
-                    width,
-                    height,
-                    max(4, grid_rows * 2),
-                    panel.dpi_y if panel is not None else 96,
-                )
-                body.configure(
-                    padx=metrics.outer_padding,
-                    pady=max(12, metrics.outer_padding - 4),
-                )
-                font_panel_title.configure(size=metrics.title_points)
-                font_panel_value.configure(size=metrics.value_points)
-                font_panel_meta.configure(size=metrics.meta_points)
-                font_panel_footer.configure(size=metrics.footer_points)
+                metric_row_count = max(4, grid_rows * 2)
                 pos_map: dict[int, tuple[int, int]] = {}
                 for r_i, idx in enumerate(col0_indices):
                     pos_map[idx] = (0, r_i)
                 for r_i, idx in enumerate(col1_indices):
                     pos_map[idx] = (1, r_i)
                 col_positions = [pos_map[idx] for idx in range(len(rows))]
+
+        metrics = _panel_metrics(width, height, metric_row_count, dpi_y)
+        target_pady = max(12, metrics.outer_padding - 4)
+        if (
+            int(body.cget("padx") or 0) != metrics.outer_padding
+            or int(body.cget("pady") or 0) != target_pady
+        ):
+            body.configure(padx=metrics.outer_padding, pady=target_pady)
+        _configure_font_if_changed(font_panel_title, size=metrics.title_points)
+        _configure_font_if_changed(font_panel_value, size=metrics.value_points)
+        _configure_font_if_changed(font_panel_meta, size=metrics.meta_points)
+        _configure_font_if_changed(font_panel_footer, size=metrics.footer_points)
 
         presentations = [_panel_row_presentation(dr) for dr in rows]
         structure = _panel_layout_key(
@@ -8071,8 +8093,16 @@ def run_ui() -> None:
         nav_track = tk.Frame(shell, bg=S_TAB_TRACK_BG, padx=4, pady=4, bd=0, highlightthickness=0)
         nav_track.pack(fill="x", pady=(0, 12))
 
-        content_host = tk.Frame(shell, bg=S_PAGE_BG, width=568, height=540, bd=0, highlightthickness=0)
+        content_host = tk.Frame(
+            shell,
+            bg=S_PAGE_BG,
+            width=564,
+            height=504,
+            bd=0,
+            highlightthickness=0,
+        )
         content_host.pack(fill="both", expand=True)
+        content_host.pack_propagate(False)
 
         providers_tab = tk.Frame(content_host, bg=S_PAGE_BG)
         display_tab = tk.Frame(content_host, bg=S_PAGE_BG)
@@ -8139,8 +8169,16 @@ def run_ui() -> None:
         wp_nav_track = tk.Frame(wp_nav_row, bg=S_TAB_TRACK_BG, padx=3, pady=3, bd=0, highlightthickness=0)
         wp_nav_track.pack(side="left")
 
-        wp_content_host = tk.Frame(wallpaper_outer_pad, bg=S_PAGE_BG, bd=0, highlightthickness=0)
+        wp_content_host = tk.Frame(
+            wallpaper_outer_pad,
+            bg=S_PAGE_BG,
+            width=564,
+            height=460,
+            bd=0,
+            highlightthickness=0,
+        )
         wp_content_host.pack(fill="both", expand=True)
+        wp_content_host.pack_propagate(False)
 
         directories_tab = tk.Frame(wp_content_host, bg=S_PAGE_BG)
         weights_tab = tk.Frame(wp_content_host, bg=S_PAGE_BG)
@@ -9341,27 +9379,76 @@ def run_ui() -> None:
         folder_canvas_window = folder_canvas.create_window(
             (0, 0), window=folder_rows, anchor="nw"
         )
-        folder_rows.bind(
-            "<Configure>",
-            lambda _event: folder_canvas.configure(
-                scrollregion=folder_canvas.bbox("all")
-            ),
-        )
-        folder_canvas.bind(
-            "<Configure>",
-            lambda event: folder_canvas.itemconfigure(
-                folder_canvas_window, width=event.width
-            ),
-        )
+        def _bind_scrollable_canvas(
+            canvas: tk.Canvas,
+            rows_frame: tk.Frame,
+            window_id: int,
+        ) -> tuple[Callable[[], None], Callable[[Any], str]]:
+            scroll_state: dict[str, Any] = {
+                "width": -1,
+                "scrollregion": None,
+            }
 
-        def scroll_folder_list(event: Any) -> str:
-            delta = int(getattr(event, "delta", 0) or 0)
-            if delta:
-                steps = -int(delta / 120)
-                if steps == 0:
-                    steps = -1 if delta > 0 else 1
-                folder_canvas.yview_scroll(steps, "units")
-            return "break"
+            def sync_scrollregion() -> None:
+                try:
+                    if not canvas.winfo_exists() or not rows_frame.winfo_exists():
+                        return
+                    canvas_w = max(1, int(canvas.winfo_width()))
+                    canvas_h = max(1, int(canvas.winfo_height()))
+                    req_h = max(0, int(rows_frame.winfo_reqheight()))
+                    region_h = max(req_h, canvas_h)
+                    region = (0, 0, canvas_w, region_h)
+                    if region != scroll_state["scrollregion"]:
+                        scroll_state["scrollregion"] = region
+                        canvas.configure(scrollregion=region)
+                    if req_h <= canvas_h:
+                        y0, _y1 = canvas.yview()
+                        if y0 != 0.0:
+                            canvas.yview_moveto(0.0)
+                except Exception:
+                    pass
+
+            def on_rows_configure(_event: Any = None) -> None:
+                sync_scrollregion()
+
+            def on_canvas_configure(event: Any = None) -> None:
+                try:
+                    w = int(getattr(event, "width", 0) or canvas.winfo_width())
+                    if w > 1 and w != scroll_state["width"]:
+                        scroll_state["width"] = w
+                        canvas.itemconfigure(window_id, width=w)
+                except Exception:
+                    pass
+                sync_scrollregion()
+
+            def on_mousewheel(event: Any) -> str:
+                try:
+                    req_h = int(rows_frame.winfo_reqheight())
+                    canvas_h = int(canvas.winfo_height())
+                    if req_h <= canvas_h:
+                        y0, _y1 = canvas.yview()
+                        if y0 != 0.0:
+                            canvas.yview_moveto(0.0)
+                        return "break"
+                    delta = int(getattr(event, "delta", 0) or 0)
+                    if delta:
+                        steps = -int(delta / 120)
+                        if steps == 0:
+                            steps = -1 if delta > 0 else 1
+                        canvas.yview_scroll(steps, "units")
+                except Exception:
+                    pass
+                return "break"
+
+            rows_frame.bind("<Configure>", on_rows_configure)
+            canvas.bind("<Configure>", on_canvas_configure)
+            return sync_scrollregion, on_mousewheel
+
+        sync_folder_scrollregion, scroll_folder_list = _bind_scrollable_canvas(
+            folder_canvas,
+            folder_rows,
+            folder_canvas_window,
+        )
 
         def bind_folder_list_wheel(widget: Any) -> None:
             widget.bind("<MouseWheel>", scroll_folder_list)
@@ -9569,27 +9656,11 @@ def run_ui() -> None:
         weight_canvas_window = weight_canvas.create_window(
             (0, 0), window=weight_rows, anchor="nw"
         )
-        weight_rows.bind(
-            "<Configure>",
-            lambda _event: weight_canvas.configure(
-                scrollregion=weight_canvas.bbox("all")
-            ),
+        sync_weight_scrollregion, scroll_weight_list = _bind_scrollable_canvas(
+            weight_canvas,
+            weight_rows,
+            weight_canvas_window,
         )
-        weight_canvas.bind(
-            "<Configure>",
-            lambda event: weight_canvas.itemconfigure(
-                weight_canvas_window, width=event.width
-            ),
-        )
-
-        def scroll_weight_list(event: Any) -> str:
-            delta = int(getattr(event, "delta", 0) or 0)
-            if delta:
-                steps = -int(delta / 120)
-                if steps == 0:
-                    steps = -1 if delta > 0 else 1
-                weight_canvas.yview_scroll(steps, "units")
-            return "break"
 
         def bind_weight_list_wheel(widget: Any) -> None:
             widget.bind("<MouseWheel>", scroll_weight_list)
@@ -9599,6 +9670,7 @@ def run_ui() -> None:
         bind_weight_list_wheel(weight_list_frame)
 
         folder_row_records: list[dict[str, Any]] = []
+        weight_row_records: list[dict[str, Any]] = []
 
         def restart_wallpaper_preparation(delay_ms: int = 350) -> None:
             if state.get("wallpaper_active"):
@@ -9700,9 +9772,6 @@ def run_ui() -> None:
         def refresh_weight_rows() -> None:
             nonlocal settings_media_files
             wp_subtab_state["weights_dirty"] = False
-            for child in weight_rows.winfo_children():
-                child.destroy()
-            weight_vars.clear()
             enabled_folders = _enabled_wallpaper_folders(
                 wallpaper_folders,
                 wallpaper_disabled_folders,
@@ -9721,6 +9790,35 @@ def run_ui() -> None:
                 wallpaper_folder_depths,
             )
             scanning_now: set[str] = state.get("wallpaper_scanning_folders") or set()
+            weights = dict(state.get("wallpaper_subdir_weights") or {})
+            target_keys = [_wallpaper_path_key(directory) for directory, _ in directories]
+            existing_keys = [rec.get("key") for rec in weight_row_records]
+            if (
+                directories
+                and target_keys == existing_keys
+                and all(rec["row"].winfo_exists() for rec in weight_row_records)
+            ):
+                for (directory, media_count), rec in zip(directories, weight_row_records):
+                    key = rec["key"]
+                    dir_text = _wallpaper_directory_label(
+                        directory,
+                        wallpaper_folders,
+                        max_chars=44,
+                    )
+                    if str(rec["dir_lbl"].cget("text")) != dir_text:
+                        rec["dir_lbl"].configure(text=dir_text)
+                    cnt_text = f"  {media_count} 个媒体"
+                    if str(rec["count_lbl"].cget("text")) != cnt_text:
+                        rec["count_lbl"].configure(text=cnt_text)
+                    target_val = str(weights.get(key, WALLPAPER_DIR_WEIGHT_DEFAULT))
+                    if key in weight_vars and str(weight_vars[key].get()) != target_val:
+                        weight_vars[key].set(target_val)
+                return
+
+            for child in weight_rows.winfo_children():
+                child.destroy()
+            weight_row_records.clear()
+            weight_vars.clear()
             if not directories:
                 empty_msg = (
                     "正在后台慢速扫描目录索引，请稍候…"
@@ -9737,8 +9835,8 @@ def run_ui() -> None:
                     justify="left",
                     wraplength=460,
                 ).pack(fill="x", pady=12, padx=6)
+                sync_weight_scrollregion()
                 return
-            weights = dict(state.get("wallpaper_subdir_weights") or {})
             for directory, media_count in directories:
                 key = _wallpaper_path_key(directory)
                 row = tk.Frame(
@@ -9753,7 +9851,7 @@ def run_ui() -> None:
                 row.grid_columnconfigure(0, weight=1)
                 label_frame = tk.Frame(row, bg=S_SURFACE_ALT)
                 label_frame.grid(row=0, column=0, sticky="ew")
-                tk.Label(
+                dir_lbl = tk.Label(
                     label_frame,
                     text=_wallpaper_directory_label(
                         directory,
@@ -9765,15 +9863,17 @@ def run_ui() -> None:
                     font=settings_font_small,
                     anchor="w",
                     justify="left",
-                ).pack(side="left")
-                tk.Label(
+                )
+                dir_lbl.pack(side="left")
+                count_lbl = tk.Label(
                     label_frame,
                     text=f"  {media_count} 个媒体",
                     fg=S_MUTED,
                     bg=S_SURFACE_ALT,
                     font=settings_font_badge,
                     anchor="w",
-                ).pack(side="left", padx=(6, 0))
+                )
+                count_lbl.pack(side="left", padx=(6, 0))
                 variable = tk.StringVar(
                     value=str(weights.get(key, WALLPAPER_DIR_WEIGHT_DEFAULT))
                 )
@@ -9805,7 +9905,17 @@ def run_ui() -> None:
                     "<Return>",
                     lambda _event, k=key, v=variable: apply_directory_weight(k, v),
                 )
+                weight_row_records.append(
+                    {
+                        "key": key,
+                        "row": row,
+                        "dir_lbl": dir_lbl,
+                        "count_lbl": count_lbl,
+                        "spinbox": spinbox,
+                    }
+                )
             bind_weight_list_wheel(weight_rows)
+            sync_weight_scrollregion()
 
         wp_subtab_state["refresh_weights"] = refresh_weight_rows
 
@@ -9839,17 +9949,21 @@ def run_ui() -> None:
                 if (scanning_set or uncached_all)
                 else ""
             )
-            folder_status.configure(
-                text=(
-                    f"已启用 {len(enabled_folders)} / 共 {len(wallpaper_folders)} 个目录"
-                    f" · 已缓存 {total_cached_media} 个媒体 · {engine_text}{scan_note}"
-                )
+            status_text = (
+                f"已启用 {len(enabled_folders)} / 共 {len(wallpaper_folders)} 个目录"
+                f" · 已缓存 {total_cached_media} 个媒体 · {engine_text}{scan_note}"
             )
+            if str(folder_status.cget("text")) != status_text:
+                folder_status.configure(text=status_text)
 
         def _apply_folder_row_visual(rec: dict[str, Any], enabled: bool) -> None:
+            is_scanning = bool(rec.get("is_scanning"))
+            visual_sig = (bool(enabled), is_scanning)
+            if rec.get("_visual_sig") == visual_sig:
+                return
+            rec["_visual_sig"] = visual_sig
             row_bg = S_SURFACE_ALT if enabled else S_BAR_OFF_BG
             row_fg = S_TEXT if enabled else S_BAR_OFF_FG
-            is_scanning = bool(rec.get("is_scanning"))
             badge_fg = (
                 S_ACCENT_BLUE
                 if is_scanning
@@ -9911,10 +10025,6 @@ def run_ui() -> None:
         def refresh_wallpaper_directory_ui() -> None:
             if not win.winfo_exists():
                 return
-            for child in folder_rows.winfo_children():
-                child.destroy()
-            folder_row_records.clear()
-            depth_vars.clear()
             disabled_keys = {
                 _wallpaper_path_key(folder)
                 for folder in wallpaper_disabled_folders
@@ -9926,6 +10036,58 @@ def run_ui() -> None:
                 "wallpaper_scanning_folders", set()
             )
             uncached_all: list[str] = []
+            current_keys = [_wallpaper_path_key(f) for f in wallpaper_folders]
+            existing_keys = [rec.get("key") for rec in folder_row_records]
+
+            if (
+                wallpaper_folders
+                and current_keys == existing_keys
+                and all(rec["row"].winfo_exists() for rec in folder_row_records)
+            ):
+                for index, folder in enumerate(wallpaper_folders):
+                    key = current_keys[index]
+                    enabled = key not in disabled_keys
+                    entry = index_cache.get(key)
+                    is_scanning = key in scanning_set
+                    if not is_scanning and (
+                        not isinstance(entry, dict)
+                        or not isinstance(entry.get("files"), list)
+                    ):
+                        uncached_all.append(folder)
+                        is_scanning = True
+                    rec = folder_row_records[index]
+                    rec["folder"] = folder
+                    rec["is_scanning"] = is_scanning
+                    elided = _middle_elide_path(folder, max_chars=34)
+                    if str(rec["path"].cget("text")) != elided:
+                        rec["path"].configure(text=elided)
+                    count_num = (
+                        len(entry.get("files") or [])
+                        if isinstance(entry, dict)
+                        else 0
+                    )
+                    badge_text = "扫描中…" if is_scanning else f"{count_num} 媒体"
+                    if str(rec["badge"].cget("text")) != badge_text:
+                        rec["badge"].configure(text=badge_text)
+                    depth_val = wallpaper_folder_depths.get(
+                        key, WALLPAPER_DIR_DEPTH_DEFAULT
+                    )
+                    if key in depth_vars and str(depth_vars[key].get()) != str(depth_val):
+                        depth_vars[key].set(str(depth_val))
+                    _apply_folder_row_visual(rec, enabled)
+                update_wallpaper_folder_status(uncached_all)
+                request_weight_rows_refresh()
+                if uncached_all:
+                    _ensure_wallpaper_folders_indexed_async(
+                        uncached_all,
+                        notify_start=False,
+                    )
+                return
+
+            for child in folder_rows.winfo_children():
+                child.destroy()
+            folder_row_records.clear()
+            depth_vars.clear()
 
             if not wallpaper_folders:
                 tk.Label(
@@ -10070,6 +10232,8 @@ def run_ui() -> None:
 
                 folder_row_records.append(
                     {
+                        "key": key,
+                        "folder": folder,
                         "row": row,
                         "chk": chk_lbl,
                         "path": path_lbl,
@@ -10079,14 +10243,19 @@ def run_ui() -> None:
                         "rec_lbl": rec_lbl,
                         "badge": badge_lbl,
                         "is_scanning": is_scanning,
+                        "_visual_sig": (bool(enabled), bool(is_scanning)),
                     }
                 )
 
             bind_folder_list_wheel(folder_rows)
+            sync_folder_scrollregion()
             update_wallpaper_folder_status(uncached_all)
             request_weight_rows_refresh()
             if uncached_all:
-                _ensure_wallpaper_folders_indexed_async(uncached_all)
+                _ensure_wallpaper_folders_indexed_async(
+                    uncached_all,
+                    notify_start=False,
+                )
 
         state["wallpaper_scan_callback"] = refresh_wallpaper_directory_ui
 
@@ -10114,7 +10283,11 @@ def run_ui() -> None:
             state.setdefault("wallpaper_scanning_folders", set()).add(key)
             refresh_wallpaper_directory_ui()
             state.setdefault("wallpaper_scanning_folders", set()).discard(key)
-            _ensure_wallpaper_folders_indexed_async([folder_path], force_rescan=True)
+            _ensure_wallpaper_folders_indexed_async(
+                [folder_path],
+                force_rescan=True,
+                notify_start=False,
+            )
 
         def rescan_all_wallpaper_folders() -> None:
             if not wallpaper_folders:
@@ -10122,6 +10295,7 @@ def run_ui() -> None:
             _ensure_wallpaper_folders_indexed_async(
                 list(wallpaper_folders),
                 force_rescan=True,
+                notify_start=False,
             )
             refresh_wallpaper_directory_ui()
 
@@ -11579,10 +11753,25 @@ def run_ui() -> None:
         bg_layer.bind("<Escape>", lambda _e: do_quit())
         bg_layer.bind("<F5>", lambda _e: refresh_async(force=True))
     root.bind("<Button-3>", show_menu)
-    root.bind("<FocusIn>", lambda _e: root.after_idle(stack_text_above_plate))
-    root.bind("<Map>", lambda _e: root.after_idle(stack_text_above_plate))
+    root.bind(
+        "<FocusIn>",
+        lambda event: root.after_idle(stack_text_above_plate)
+        if getattr(event, "widget", None) is root
+        else None,
+    )
+    root.bind(
+        "<Map>",
+        lambda event: root.after_idle(stack_text_above_plate)
+        if getattr(event, "widget", None) is root
+        else None,
+    )
     if bg_layer is not None:
-        bg_layer.bind("<FocusIn>", lambda _e: root.after_idle(stack_text_above_plate))
+        bg_layer.bind(
+            "<FocusIn>",
+            lambda event: root.after_idle(stack_text_above_plate)
+            if getattr(event, "widget", None) is bg_layer
+            else None,
+        )
     root.bind("<Escape>", lambda _e: do_quit())
     root.bind("<F5>", lambda _e: refresh_async(force=True))
 

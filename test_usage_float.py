@@ -2205,9 +2205,14 @@ class WallpaperDirectoryAndIndexTests(unittest.TestCase):
             )
             self.assertLess(write_ms, 150.0)
 
+    def test_settings_wallpaper_directory_list_does_not_jitter_on_refresh_or_scroll(self) -> None:
+        source = Path(usage_float_module.__file__).read_text(encoding="utf-8")
+        self.assertIn("def _configure_font_if_changed(", source)
+        self.assertIn("content_host.pack_propagate(False)", source)
+        self.assertIn("wp_content_host.pack_propagate(False)", source)
+        self.assertIn("def _bind_scrollable_canvas(", source)
+        self.assertIn("notify_start=False", source)
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
