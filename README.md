@@ -8,7 +8,7 @@ Windows 用量 HUD：把 Claude / Codex / Grok / Antigravity 订阅用量（以�
 
 ![专用副屏用量面板](docs/screenshots/panel.png)
 
-用量设置（扫描、勾选、拖动排序）：
+用量设置（双列自由拖动排布、未勾选默认置灰）：
 
 ![用量设置](docs/screenshots/settings-usage.png)
 
@@ -16,9 +16,13 @@ Windows 用量 HUD：把 Claude / Codex / Grok / Antigravity 订阅用量（以�
 
 ![副屏与快捷键设置](docs/screenshots/settings-display.png)
 
+动态壁纸目录与递归层数（立即添加、后台慢扫描索引、超长路径省略中间段）：
+
+![动态壁纸目录设置](docs/screenshots/settings-wallpaper.png)
+
 动态壁纸目录权重（PlayStation △□○✕ 为示例目录名）：
 
-![动态壁纸随机权重](docs/screenshots/settings-wallpaper.png)
+![动态壁纸随机权重](docs/screenshots/settings-wallpaper-weights.png)
 
 ## 安装与启动
 
@@ -40,6 +44,7 @@ python usage_float.py autostart on  # 开机自启
 | Provider | 默认凭证 |
 |---|---|
 | Claude | `~/.claude/.credentials.json` |
+| Claude 第二账号 | `~/.claude-2/.credentials.json`（可用 `CLAUDE_HOME_2`） |
 | Codex | `~/.codex/auth.json` |
 | Codex 第二账号 | `~/.codex-2/auth.json`（可用 `CODEX_HOME_2`） |
 | Grok | `~/.grok` 登录态 |
@@ -71,18 +76,20 @@ $env:CODEX_HOME="$env:USERPROFILE\.codex-2"; codex login
 
 **用量**
 
-- **扫描 provider**：检测本机可用的 provider，状态统一显示「已检测到 / 未检测到」；登录是否有效以实际用量查询为准
-- **勾选「显示」**：只画勾上的行；空格键切换当前行
-- **拖动行**：按住名称或状态列上下拖，调整面板顺序（点第一列是勾选，不是拖动）
-- Claude 拆成 `fable 7d`、`claude 7d`、`claude 5h` 三行，各自勾选、排序，可与其他 provider 穿插
-- Antigravity 拆成 `agy gemini 7d`、`agy gemini 5h`、`agy claude 7d`、`agy claude 5h` 四个独立设置项，各自勾选、排序，可与其他 provider 穿插。小浮窗将 Gemini 简称为 `gem`，保留窗口周期
+- **双列拖动排布**：直接将每个栏在左右两列间自由拖动，决定副屏面板显示位置；未勾选的项默认置灰
+- **扫描可用账号**：检测本机可用的 provider，状态统一显示「已就绪 / 未启用 / 未检测到」；登录是否有效以实际用量查询为准
+- **快速勾选 / 自动均分**：点击左侧方框或双击任意栏即可切换启用/置灰；支持一键自动均分两列
+- Claude 拆成 `fable 7d`、`claude 7d`、`claude 5h`（以及第二账号 `Claude 2 7d`、`Claude 2 5h`），各自独立勾选与排布
+- Antigravity 拆成 `agy gemini 7d`、`agy gemini 5h`、`agy claude 7d`、`agy claude 5h` 四个独立设置项。小浮窗将 Gemini 简称为 `gem`，保留窗口周期
 - 没有本机凭证的 provider 不占位；Antigravity 安装 CLI 后会查询。未登录或查询失败时，没有上次成功读数才显示「更新失败」
 - LiteLLM 代理的重置时区，默认 UTC+8
 
 **副屏**：选中目标显示器 → 打开「专用副屏模式」。程序按显示器硬件标识锁定副屏，重新插拔后再铺满；显示器被拔掉时临时退回悬浮窗。快捷键也在这一页，可改成连按 N 次或组合键。
 
-**动态壁纸**：添加媒体目录（含子目录），可给子目录加权。
+**动态壁纸**：添加媒体目录（含子目录），可为每个目录设置子目录递归层数（0–8 层）并为分组加权。
 
+- 添加目录后立即生效，在后台慢速扫描并持久化缓存索引（`~/.usage-float/wallpaper-index.json`），打开「随机权重」直接读取缓存索引，不重复全盘扫描
+- 目录名过长时自动省略中间层级，保证完整显示首段与末段
 - 支持常见 JPG / PNG / WebP / GIF / MP4 / WebM / MKV / MOV
 - 每次进入随机首项；30 分钟以内的视频从头播，更长的优先随机章节，没有章节则随机时间
 - 图片默认停留 10 秒（2–300 秒可调）；竖图居中裁成正方形，横图和视频铺满副屏

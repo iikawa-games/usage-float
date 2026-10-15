@@ -9,6 +9,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import usage_float as usage_float_module
+usage_float_module.TOKEN_MONITOR_HUB_URL = ""
+
 
 from usage_float import (
     BG_OPACITY_DEFAULT,
@@ -1910,5 +1912,302 @@ class ClaudeResetTests(unittest.TestCase):
             self.assertEqual(calls, [])
 
 
+class UnifiedInterfaceTests(unittest.TestCase):
+    def test_fetch_from_unified_interface_parses_providers(self) -> None:
+        payload = {
+            "ok": True,
+            "providers": {
+                "claude": {
+                    "provider_id": "claude",
+                    "display_name": "claude",
+                    "plan_label": "Pro",
+                    "windows": [
+                        {"id": "five_hour", "label": "5h", "used_pct": 16.0, "resets_at": "2026-10-13T09:19:59.644Z"},
+                        {"id": "seven_day", "label": "7d", "used_pct": 95.0, "resets_at": "2026-10-15T20:59:59.644Z"},
+                    ],
+                    "available": True,
+                    "stale": False,
+                    "error": None,
+                    "fetched_at": "2026-10-13T06:29:25.740Z",
+                    "reset_block": None,
+                },
+                "codex": {
+                    "provider_id": "codex",
+                    "display_name": "codex",
+                    "plan_label": "Pro More",
+                    "windows": [
+                        {"id": "seven_day", "label": "7d", "used_pct": 2.0, "resets_at": "2026-10-20T04:58:05.000Z"},
+                    ],
+                    "available": True,
+                    "stale": False,
+                    "error": None,
+                    "fetched_at": "2026-10-13T06:29:25.741Z",
+                    "reset_block": {"availableCount": 1},
+                },
+            },
+        }
+
+        mock_resp = unittest.mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch.object(usage_float_module.urllib.request, "urlopen", return_value=mock_resp):
+            res = usage_float_module.fetch_from_unified_interface("http://127.0.0.1:17321")
+            self.assertIsNotNone(res)
+            self.assertIn("claude", res)
+            self.assertIn("codex", res)
+            self.assertEqual(len(res["claude"].windows), 2)
+            self.assertEqual(res["claude"].windows[0].used_pct, 16.0)
+            self.assertEqual(res["codex"].reset_block, {"availableCount": 1})
+
+    def test_fetch_all_uses_unified_interface_when_available(self) -> None:
+        claude_p = ProviderUsage(
+            provider_id="claude",
+            display_name="claude",
+            available=True,
+            windows=[UsageWindow("five_hour", "5h", 12.0)],
+        )
+        with patch.object(usage_float_module, "fetch_from_unified_interface", return_value={"claude": claude_p}):
+            out = usage_float_module.fetch_all(["claude:5h"])
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out[0].provider_id, "claude")
+            self.assertEqual(out[0].windows[0].used_pct, 12.0)
+
+    def test_fetch_all_falls_back_when_unified_interface_fails(self) -> None:
+        with patch.object(usage_float_module, "fetch_from_unified_interface", return_value=None), \
+                patch.object(usage_float_module, "fetch_claude_usage", return_value=ProviderUsage(provider_id="claude", display_name="claude", available=True)) as fallback:
+            out = usage_float_module.fetch_all(["claude:5h"])
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out[0].provider_id, "claude")
+            fallback.assert_called_once()
+
+
+class ProviderColumnTests(unittest.TestCase):
+    def test_resolve_provider_columns_splits_enabled_items_into_two_columns(self) -> None:
+        all_ids = list(DEFAULT_PROVIDERS)
+        enabled = all_ids[:4]
+        disabled = all_ids[4:]
+        left, right = usage_float_module.resolve_provider_columns(
+            enabled, disabled, all_ids, None
+        )
+        self.assertEqual(left[:2], enabled[:2])
+        self.assertEqual(right[:2], enabled[2:4])
+        self.assertEqual(set(left + right), set(all_ids))
+
+    def test_resolve_provider_columns_respects_saved_two_column_assignment(self) -> None:
+        all_ids = list(DEFAULT_PROVIDERS)
+        enabled = ["claude:7d", "codex", "llmproxy"]
+        disabled = [pid for pid in all_ids if pid not in set(enabled)]
+        saved_cols = [["codex"], ["claude:7d", "llmproxy", *disabled]]
+        left, right = usage_float_module.resolve_provider_columns(
+            enabled, disabled, all_ids, saved_cols
+        )
+        self.assertEqual(left, ["codex"])
+        self.assertEqual(right[:2], ["claude:7d", "llmproxy"])
+        self.assertEqual(set(left + right), set(all_ids))
+
+    def test_move_provider_in_columns_moves_across_and_within_columns(self) -> None:
+        left = ["claude:7d", "claude:5h"]
+        right = ["codex", "llmproxy"]
+        new_left, new_right = usage_float_module.move_provider_in_columns(
+            left, right, "codex", 0, 1
+        )
+        self.assertEqual(new_left, ["claude:7d", "codex", "claude:5h"])
+        self.assertEqual(new_right, ["llmproxy"])
+
+        reordered_left, reordered_right = usage_float_module.move_provider_in_columns(
+            new_left, new_right, "claude:5h", 1, 0
+        )
+        self.assertEqual(reordered_left, ["claude:7d", "codex"])
+        self.assertEqual(reordered_right, ["claude:5h", "llmproxy"])
+
+
+class WallpaperDirectoryAndIndexTests(unittest.TestCase):
+    def test_middle_elide_path_preserves_first_and_last_segments(self) -> None:
+        short = r"E:\Wallpapers\Anime"
+        self.assertEqual(usage_float_module._middle_elide_path(short, 38), short)
+
+        long_path = r"E:\MediaLibrary\DynamicWallpapers\2026_Collection\Season_Autumn\4K_Vertical\SubFolder_Final"
+        elided = usage_float_module._middle_elide_path(long_path, 38)
+        self.assertTrue(elided.startswith(r"E:\MediaLibrary"))
+        self.assertTrue(elided.endswith("SubFolder_Final"))
+        self.assertIn("…", elided)
+
+        rel_label = "DynamicWallpapers / 2026_Collection / Season_Autumn / 4K_Vertical / SubFolder_Final"
+        elided_rel = usage_float_module._middle_elide_path(rel_label, 38)
+        self.assertTrue(elided_rel.startswith("DynamicWallpapers"))
+        self.assertTrue(elided_rel.endswith("SubFolder_Final"))
+        self.assertIn("…", elided_rel)
+
+    def test_wallpaper_bucket_directory_respects_recursion_depth_per_root(self) -> None:
+        root_a = Path(r"E:\Wallpapers\PackA")
+        deep_file = root_a / "Cat1" / "Sub2" / "Sub3" / "clip.mp4"
+        direct_file = root_a / "root_clip.mp4"
+
+        # Depth 0: everything under root_a is grouped into root_a itself
+        self.assertEqual(
+            usage_float_module._wallpaper_bucket_directory(
+                deep_file, [str(root_a)], {str(root_a): 0}
+            ),
+            root_a,
+        )
+        # Depth 1 (default): grouped into first-level subdirectory Cat1
+        self.assertEqual(
+            usage_float_module._wallpaper_bucket_directory(
+                deep_file, [str(root_a)], {str(root_a): 1}
+            ),
+            root_a / "Cat1",
+        )
+        # Depth 2: grouped into second-level subdirectory Cat1/Sub2
+        self.assertEqual(
+            usage_float_module._wallpaper_bucket_directory(
+                deep_file, [str(root_a)], {str(root_a): 2}
+            ),
+            root_a / "Cat1" / "Sub2",
+        )
+        # Direct file in root_a stays in root_a at any depth
+        self.assertEqual(
+            usage_float_module._wallpaper_bucket_directory(
+                direct_file, [str(root_a)], {str(root_a): 2}
+            ),
+            root_a,
+        )
+
+    def test_media_directories_and_weighted_random_use_configured_depths(self) -> None:
+        root_a = Path(r"E:\Wallpapers\PackA")
+        files = [
+            root_a / "A1" / "Deep1" / "v1.mp4",
+            root_a / "A1" / "Deep2" / "v2.mp4",
+            root_a / "A2" / "Deep3" / "v3.mp4",
+        ]
+        dirs_depth_1 = usage_float_module._wallpaper_media_directories(
+            files, [str(root_a)], {str(root_a): 1}
+        )
+        self.assertEqual(
+            [d for d, _count in dirs_depth_1],
+            [root_a / "A1", root_a / "A2"],
+        )
+        self.assertEqual([count for _d, count in dirs_depth_1], [2, 1])
+
+        dirs_depth_2 = usage_float_module._wallpaper_media_directories(
+            files, [str(root_a)], {str(root_a): 2}
+        )
+        self.assertEqual(
+            [d for d, _count in dirs_depth_2],
+            [
+                root_a / "A1" / "Deep1",
+                root_a / "A1" / "Deep2",
+                root_a / "A2" / "Deep3",
+            ],
+        )
+
+        # Weighting A2=100 and A1=0 at depth 1 only picks files under A2
+        chosen, _offset = usage_float_module._randomize_wallpaper_session(
+            files,
+            folder_weights={str(root_a / "A1"): 0, str(root_a / "A2"): 100},
+            random_mode=usage_float_module.WALLPAPER_RANDOM_MODE_DIRECTORY,
+            root_folders=[str(root_a)],
+            folder_depths={str(root_a): 1},
+        )
+        self.assertEqual(chosen, [root_a / "A2" / "Deep3" / "v3.mp4"])
+
+    def test_wallpaper_index_cache_roundtrip_and_lookup(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            cache_file = Path(temp_dir) / "wallpaper-index.json"
+            folder_a = str(Path(temp_dir) / "FolderA")
+            file_1 = str(Path(folder_a) / "sub" / "a.mp4")
+            file_2 = str(Path(folder_a) / "sub" / "b.png")
+            raw_cache = {
+                folder_a: {
+                    "files": [file_1, file_2],
+                    "updated_at": 1700000000.0,
+                }
+            }
+            usage_float_module.save_wallpaper_index_cache(raw_cache, cache_file)
+            loaded = usage_float_module.load_wallpaper_index_cache(cache_file)
+            media, unindexed = usage_float_module._cached_wallpaper_media_for_folders(
+                [folder_a, str(Path(temp_dir) / "UnindexedFolder")],
+                loaded,
+            )
+            self.assertEqual(media, [Path(file_1), Path(file_2)])
+            self.assertEqual(unindexed, [str(Path(temp_dir) / "UnindexedFolder")])
+
+    def test_scan_wallpaper_folder_slow_finds_media_and_honors_stop_check(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "sub").mkdir()
+            f1 = root / "a.mp4"
+            f2 = root / "sub" / "b.jpg"
+            ignore = root / "readme.txt"
+            f1.write_bytes(b"0")
+            f2.write_bytes(b"0")
+            ignore.write_text("hi", encoding="utf-8")
+
+            found = usage_float_module._scan_wallpaper_folder_slow(
+                root, throttle_every=1, throttle_sleep=0.0
+            )
+            self.assertEqual(found, [f1, f2])
+
+            stopped = usage_float_module._scan_wallpaper_folder_slow(
+                root, stop_check=lambda: True
+            )
+            self.assertEqual(stopped, [])
+
+    def test_large_directory_cached_lookup_and_grouping_is_fast(self) -> None:
+        import time
+
+        root_a = Path(r"E:\LargeWardrobe\Originals")
+        folder_key = usage_float_module._wallpaper_path_key(root_a)
+        raw_files = [
+            str(root_a / f"Category_{i % 12}" / f"img_{i:05d}.png")
+            for i in range(10500)
+        ]
+        index_cache = {
+            folder_key: {
+                "folder": str(root_a),
+                "files": raw_files,
+                "scanned_at": 1700000000.0,
+            }
+        }
+        # Warm up parsed path cache once
+        media_first, uncached = usage_float_module._cached_wallpaper_media_for_folders(
+            [str(root_a)],
+            index_cache,
+        )
+        self.assertEqual(len(media_first), 10500)
+        self.assertEqual(uncached, [])
+
+        t0 = time.perf_counter()
+        media_second, _ = usage_float_module._cached_wallpaper_media_for_folders(
+            [str(root_a)],
+            index_cache,
+        )
+        dirs = usage_float_module._wallpaper_media_directories(
+            media_second,
+            [str(root_a)],
+            {str(root_a): 1},
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        self.assertEqual(len(dirs), 12)
+        self.assertEqual(sum(count for _d, count in dirs), 10500)
+        self.assertLess(elapsed_ms, 80.0)
+
+        with TemporaryDirectory() as temp_dir:
+            playlist_path = Path(temp_dir) / "wallpaper.m3u"
+            t1 = time.perf_counter()
+            usage_float_module._write_wallpaper_playlist(media_second, playlist_path)
+            write_ms = (time.perf_counter() - t1) * 1000.0
+            lines = playlist_path.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(
+                len(lines),
+                1 + usage_float_module.WALLPAPER_PLAYLIST_MAX_ITEMS,
+            )
+            self.assertLess(write_ms, 80.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+
