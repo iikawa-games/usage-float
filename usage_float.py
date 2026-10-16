@@ -4942,9 +4942,11 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
     the headless interface client. The service owns cadence and activity input.
     """
     out = []
+    polled = {}
     for pid in dict.fromkeys(provider_fetch_id(item) for item in providers):
         if pid not in {*PROVIDER_DISPLAY_ITEMS, *CODEX_ACCOUNT_BY_ID, 'grok', 'llmproxy'}:
             continue
+        polled[pid] = poll = provider_poll_seconds(pid)
         try:
             with file_lock(CACHE_PATH.with_name(f'{CACHE_PATH.name}.{pid}.fetch.lock'), timeout=1):
                 key = provider_credential_key(pid)
@@ -4955,7 +4957,7 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
                 last_attempt = attempt.get('at', 0) if attempt.get('credential_key') == key else 0
                 observed = _iso_epoch(cached.fetched_at, 0) if cached else 0
                 age = time.time() - max(last_attempt, observed)
-                if not force and 0 <= age < provider_poll_seconds(pid):
+                if not force and 0 <= age < poll:
                     if cached:
                         # Keep exactly the same numbers/titles. Staleness is
                         # metadata for routing, not an extra panel label.
@@ -4997,6 +4999,18 @@ def collect_local_usage(providers: list[str], *, force: bool = False) -> list[Pr
             out.append(item)
         except Exception:
             out.append(stale_provider_usage(pid, '更新失败'))
+    if polled:
+        # Publish the cadence chosen this tick: an idle account is read every
+        # IDLE_REFRESH_SECONDS, so its reading stays current that long. The router
+        # widens freshness only while these decisions keep arriving.
+        decided = time.time()
+        def record(cache):
+            cache.setdefault('poll', {}).update(
+                {pid: {'seconds': seconds, 'at': decided} for pid, seconds in polled.items()})
+        try:
+            update_usage_cache(record)
+        except Exception:
+            pass
     return out
 
 

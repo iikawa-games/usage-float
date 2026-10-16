@@ -186,6 +186,9 @@ class UsageSafetyTests(unittest.TestCase):
         self.assertEqual(result.fetched_at, item.fetched_at)
         self.assertEqual(usage.iter_display_rows([result]), usage.iter_display_rows([item]))
         self.assertEqual(usage.provider_poll_seconds('claude'), 1800)
+        poll = usage.load_usage_cache()['poll']['claude']     # the router reads this cadence
+        self.assertEqual(poll['seconds'], 1800)
+        self.assertLessEqual(abs(time.time() - poll['at']), 60)
 
     def test_activity_resumes_normal_refresh_for_only_the_used_account(self):
         self.activity({'claude-2': 1})
