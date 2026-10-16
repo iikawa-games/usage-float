@@ -183,7 +183,15 @@ LiteLLM 虚拟 key 通常读不到 `/key/info`。刷新时打一次很便宜的 
 }
 ```
 
-`refresh_seconds` 下限 300 秒。Claude 被限流（429）时继续显示一天内最近一次成功读到的数据。这个文件可能含代理 key，不要提交。
+`refresh_seconds` 下限 300 秒。额度采集统一由 Token Monitor 服务调度，`tray/usage_backend.py` 复用本模块的 provider 解析器；只有该后台入口调用 `collect_local_usage`。公开的 `fetch_all`、浮窗和 headless 均只读 `/api/unified-usage`，手动刷新走 `/api/local-usage/refresh`；服务不可用时保留匹配账号的快照，绝不直连上游补采。
+
+忙闲来自 Token Monitor 输出的 `~/.route-manager/usage-activity.json`，不再读取另一套 `capacity.json` 忙闲判断。Claude/Codex 按各自账号目录复用原生活动读取器，Pi 使用已有会话 provider 信息和本机账号绑定，归属不明时保持 unknown。后台按账号降频：活跃约 5 分钟、闲置 30 分钟、活动缺失/过期 15 分钟。失败尝试也受该间隔约束，重新打开面板不强刷；手动刷新仍不绕过 429。
+
+面板保留原有标题、数字和布局，不添加「限流退避中」「旧数据」等提示。内部仍保留原采集时间与 stale 标记供路由判断，显示快照不会冒充新额度；`display_snapshots` 中的纯展示历史不会写回路由的 `providers`。缓存写入使用跨进程锁与原子替换。未知百分比不当作 0%。配置文件可能含代理 key，不要提交。
+
+Claude（两个账号）和 Codex 的凭据均只读：令牌轮换交给对应 CLI。认证失败时 GET 最多重读一次 CLI 已更新的凭据，重置额度的 POST 不自动重放。更换登录凭据会使原账号缓存失效；令牌轮换恰好撞上采集时，下次刷新再取得新快照。Codex 的短周期与周额度都进入缓存供路由使用，单个显示格呈现使用率较高的窗口。
+
+统一接口必须标注 `route-manager.local-usage.v1`，显式返回 `claude`、`claude-2` 等本机槽位，并匹配当前凭据指纹。旧 Hub 的泛用 provider alias 不当作账号绑定；接口不匹配时只保留本地快照，不恢复自行采集。浮窗只读额度缓存，写入由统一后台负责；用户主动执行重置卡兑换仍是独立操作。
 
 ## 开发
 

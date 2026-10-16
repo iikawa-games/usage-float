@@ -26,7 +26,7 @@ class ClaudeAccountsTests(unittest.TestCase):
                 usage, 'http_json', return_value=(200, {
                     'five_hour': {'utilization': 12}, 'seven_day': {'utilization': 34}})
             ) as call:
-                items = usage.fetch_all(['claude-2:7d', 'claude-2:5h'])
+                items = usage.collect_local_usage(['claude-2:7d', 'claude-2:5h'])
                 self.assertEqual(len(items), 1)
                 self.assertEqual(items[0].provider_id, 'claude-2')
                 self.assertEqual(items[0].plan_label, 'pro')

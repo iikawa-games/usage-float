@@ -62,6 +62,17 @@ from usage_float import (
 )
 
 
+def setUpModule():
+    temporary = TemporaryDirectory()
+    unittest.addModuleCleanup(temporary.cleanup)
+    for patcher in (
+        patch.object(usage_float_module, 'CACHE_PATH', Path(temporary.name) / 'cache.json'),
+        patch.object(usage_float_module.urllib.request, 'urlopen', side_effect=AssertionError('Unmocked network in unit test')),
+    ):
+        patcher.start()
+        unittest.addModuleCleanup(patcher.stop)
+
+
 class WallpaperBackendTests(unittest.TestCase):
     class FixedRandom:
         def __init__(self, first_name: str, percent: float = 42.5) -> None:
@@ -990,7 +1001,7 @@ class AntigravityUsageTests(unittest.TestCase):
         ), patch.object(usage_float_module, "find_antigravity_cli", return_value=Path("agy.exe")), patch.object(
             usage_float_module, "_run_antigravity_cli", side_effect=["1.3.2", json.dumps(self.report())]
         ) as run:
-            fetched = usage_float_module.fetch_all(list(usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS))
+            fetched = usage_float_module.collect_local_usage(list(usage_float_module.ANTIGRAVITY_DISPLAY_ITEMS))
             self.assertEqual(len(fetched), 1)
             self.assertEqual(run.call_count, 2)  # version + one quota query for all four rows
             self.assertTrue(fetched[0].available)
@@ -1713,7 +1724,7 @@ class ClaudeResetTests(unittest.TestCase):
             "fetch_claude_usage",
             side_effect=lambda **_kw: calls.append(1) or ProviderUsage(provider_id="claude"),
         ):
-            out = usage_float_module.fetch_all(["claude:fable", "claude:5h"])
+            out = usage_float_module.collect_local_usage(["claude:fable", "claude:5h"])
 
         self.assertEqual(len(calls), 1)
         self.assertEqual([p.provider_id for p in out], ["claude"])
@@ -1913,74 +1924,76 @@ class ClaudeResetTests(unittest.TestCase):
 
 
 class UnifiedInterfaceTests(unittest.TestCase):
-    def test_fetch_from_unified_interface_parses_providers(self) -> None:
-        payload = {
-            "ok": True,
-            "providers": {
-                "claude": {
-                    "provider_id": "claude",
-                    "display_name": "claude",
-                    "plan_label": "Pro",
-                    "windows": [
-                        {"id": "five_hour", "label": "5h", "used_pct": 16.0, "resets_at": "2026-10-13T09:19:59.644Z"},
-                        {"id": "seven_day", "label": "7d", "used_pct": 95.0, "resets_at": "2026-10-15T20:59:59.644Z"},
-                    ],
-                    "available": True,
-                    "stale": False,
-                    "error": None,
-                    "fetched_at": "2026-10-13T06:29:25.740Z",
-                    "reset_block": None,
-                },
-                "codex": {
-                    "provider_id": "codex",
-                    "display_name": "codex",
-                    "plan_label": "Pro More",
-                    "windows": [
-                        {"id": "seven_day", "label": "7d", "used_pct": 2.0, "resets_at": "2026-10-20T04:58:05.000Z"},
-                    ],
-                    "available": True,
-                    "stale": False,
-                    "error": None,
-                    "fetched_at": "2026-10-13T06:29:25.741Z",
-                    "reset_block": {"availableCount": 1},
-                },
-            },
-        }
+    def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        for patcher in (
+            patch.object(usage_float_module, 'CACHE_PATH', Path(temporary.name) / 'cache.json'),
+            patch.object(usage_float_module, 'TOKEN_MONITOR_HUB_URL', 'http://127.0.0.1:17321'),
+            patch.object(usage_float_module, 'provider_credential_key', return_value='local-slot'),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
-        mock_resp = unittest.mock.MagicMock()
-        mock_resp.status = 200
-        mock_resp.read.return_value = json.dumps(payload).encode("utf-8")
-        mock_resp.__enter__.return_value = mock_resp
+    def response(self, payload):
+        response = unittest.mock.MagicMock()
+        response.read.return_value = json.dumps(payload).encode('utf-8')
+        response.__enter__.return_value = response
+        return response
 
-        with patch.object(usage_float_module.urllib.request, "urlopen", return_value=mock_resp):
-            res = usage_float_module.fetch_from_unified_interface("http://127.0.0.1:17321")
-            self.assertIsNotNone(res)
-            self.assertIn("claude", res)
-            self.assertIn("codex", res)
-            self.assertEqual(len(res["claude"].windows), 2)
-            self.assertEqual(res["claude"].windows[0].used_pct, 16.0)
-            self.assertEqual(res["codex"].reset_block, {"availableCount": 1})
+    def test_reads_exact_slot_snapshot_without_upstream_or_cache_writes(self):
+        row = ProviderUsage(provider_id='claude-2', display_name='claude-2',
+                            credential_key='local-slot', windows=[UsageWindow('five_hour', '5h', 12)],
+                            stale=True, fetched_at='2026-10-15T00:00:00Z')
+        response = self.response({'schema': 'route-manager.local-usage.v1',
+                                  'providers': {'claude-2': usage_float_module._provider_to_dict(row)}})
+        with patch.object(usage_float_module.urllib.request, 'urlopen', return_value=response) as request, patch.object(
+            usage_float_module, 'collect_local_usage'
+        ) as direct, patch.object(usage_float_module, 'save_usage_cache') as save:
+            result = usage_float_module.fetch_all(['claude-2:5h', 'claude-2:7d'])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].windows[0].used_pct, 12)
+        self.assertTrue(result[0].stale)
+        direct.assert_not_called()
+        save.assert_not_called()
+        self.assertTrue(request.call_args.args[0].full_url.endswith('/api/unified-usage'))
 
-    def test_fetch_all_uses_unified_interface_when_available(self) -> None:
-        claude_p = ProviderUsage(
-            provider_id="claude",
-            display_name="claude",
-            available=True,
-            windows=[UsageWindow("five_hour", "5h", 12.0)],
-        )
-        with patch.object(usage_float_module, "fetch_from_unified_interface", return_value={"claude": claude_p}):
-            out = usage_float_module.fetch_all(["claude:5h"])
-            self.assertEqual(len(out), 1)
-            self.assertEqual(out[0].provider_id, "claude")
-            self.assertEqual(out[0].windows[0].used_pct, 12.0)
+    def test_offline_service_keeps_snapshot_without_direct_fallback(self):
+        item = ProviderUsage(provider_id='claude', display_name='claude',
+                             windows=[UsageWindow('five_hour', '5h', 34)],
+                             fetched_at=datetime.now(timezone.utc).isoformat())
+        usage_float_module.cache_put_provider(item)
+        before = usage_float_module.CACHE_PATH.read_bytes()
+        with patch.object(usage_float_module.urllib.request, 'urlopen', side_effect=OSError('offline')), patch.object(
+            usage_float_module, 'collect_local_usage'
+        ) as direct:
+            result = usage_float_module.fetch_all(['claude:5h'])
+        self.assertEqual(result[0].windows[0].used_pct, 34)
+        self.assertEqual(usage_float_module.CACHE_PATH.read_bytes(), before)
+        direct.assert_not_called()
 
-    def test_fetch_all_falls_back_when_unified_interface_fails(self) -> None:
-        with patch.object(usage_float_module, "fetch_from_unified_interface", return_value=None), \
-                patch.object(usage_float_module, "fetch_claude_usage", return_value=ProviderUsage(provider_id="claude", display_name="claude", available=True)) as fallback:
-            out = usage_float_module.fetch_all(["claude:5h"])
-            self.assertEqual(len(out), 1)
-            self.assertEqual(out[0].provider_id, "claude")
-            fallback.assert_called_once()
+    def test_manual_refresh_is_scoped_service_request_not_local_api(self):
+        response = self.response({'schema': 'route-manager.local-usage.v1', 'providers': {}})
+        with patch.object(usage_float_module.urllib.request, 'urlopen', return_value=response) as request, patch.object(
+            usage_float_module, 'collect_local_usage'
+        ) as direct:
+            usage_float_module.fetch_all(['claude-2:5h'], force=True)
+        req = request.call_args.args[0]
+        self.assertEqual(req.method, 'POST')
+        self.assertEqual(json.loads(req.data), {'providers': ['claude-2']})
+        direct.assert_not_called()
+
+    def test_legacy_provider_alias_and_mismatched_identity_are_not_accepted(self):
+        for schema, key in ((None, 'local-slot'), ('route-manager.local-usage.v1', 'other-account')):
+            with self.subTest(schema=schema, key=key):
+                row = ProviderUsage(provider_id='claude', display_name='claude', credential_key=key,
+                                    windows=[UsageWindow('five_hour', '5h', 99)])
+                response = self.response({'schema': schema, 'providers': {'claude': usage_float_module._provider_to_dict(row)}})
+                with patch.object(usage_float_module.urllib.request, 'urlopen', return_value=response), patch.object(
+                    usage_float_module, 'collect_local_usage'
+                ) as direct:
+                    self.assertFalse(usage_float_module.fetch_all(['claude'])[0].available)
+                direct.assert_not_called()
 
 
 class ProviderColumnTests(unittest.TestCase):

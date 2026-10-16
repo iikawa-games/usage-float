@@ -14,6 +14,7 @@ usage-float — light translucent usage HUD for Claude / Codex / Grok / Antigrav
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -37,6 +38,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
+
+from usage_lock import file_lock
 
 # ---------------------------------------------------------------------------
 # Paths / constants
@@ -229,6 +232,8 @@ LLM_PROXY_DURATION_HEADERS = (
 )
 
 REFRESH_SECONDS = 300
+IDLE_REFRESH_SECONDS = 1800
+UNKNOWN_ACTIVITY_REFRESH_SECONDS = 900
 CLAUDE_429_BACKOFF_SECONDS = 900
 WINDOW_ALPHA = 0.92  # higher alpha = sharper GDI text on Windows layered windows
 WARN_PCT = 70
@@ -2599,11 +2604,21 @@ def load_usage_cache() -> dict[str, Any]:
 
 
 def save_usage_cache(cache: dict[str, Any]) -> None:
+    """Atomic publication; read/modify/write callers hold the cache lock."""
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = CACHE_PATH.with_name(f"{CACHE_PATH.name}.{uuid.uuid4().hex}.tmp")
     try:
-        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CACHE_PATH.write_text(json.dumps(cache, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        temporary.write_text(json.dumps(cache, indent=2, allow_nan=False), encoding="utf-8")
+        temporary.replace(CACHE_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def update_usage_cache(update: Callable[[dict[str, Any]], None]) -> None:
+    with file_lock(CACHE_PATH.with_suffix('.lock')):
+        cache = load_usage_cache()
+        update(cache)
+        save_usage_cache(cache)
 
 
 # ---------------------------------------------------------------------------
@@ -2715,7 +2730,7 @@ def panel_tone_color(pct: float) -> str:
 class UsageWindow:
     id: str
     label: str
-    used_pct: float
+    used_pct: float | None
     resets_at: str | None = None
 
 
@@ -2735,6 +2750,28 @@ class ProviderUsage:
     # Kept as the untouched payload so a field added upstream survives the
     # cache round-trip without a schema change here.
     reset_block: dict[str, Any] | None = None
+    # Local provenance, not an account identifier or a credential. Rotation
+    # invalidates reuse too: only the exact credential may reuse this snapshot.
+    credential_key: str | None = None
+
+
+def provider_credential_key(provider_id: str) -> str | None:
+    if provider_id in ("claude", "claude-2"):
+        home = CLAUDE_HOME_2 if provider_id == "claude-2" else CLAUDE_HOME
+        oauth, _ = read_claude_oauth(home)
+        token = (oauth or {}).get("accessToken")
+    elif provider_id in CODEX_ACCOUNT_BY_ID:
+        home = CODEX_ACCOUNT_BY_ID[provider_id].home
+        auth, _ = read_codex_auth(home)
+        tokens = (auth or {}).get("tokens") or {}
+        token = str(tokens.get("access_token") or '') + ':' + str(tokens.get("account_id") or '')
+        if not tokens.get("access_token"):
+            token = None
+    else:
+        return None
+    if not token:
+        return None
+    return hashlib.sha256((str(home.resolve()) + '\0' + token).encode()).hexdigest()
 
 
 def _provider_to_dict(p: ProviderUsage) -> dict[str, Any]:
@@ -2757,6 +2794,7 @@ def _provider_to_dict(p: ProviderUsage) -> dict[str, Any]:
         "fetched_at": p.fetched_at,
         "summary": p.summary,
         "reset_block": p.reset_block,
+        "credential_key": p.credential_key,
     }
 
 
@@ -2765,7 +2803,7 @@ def _provider_from_dict(d: dict[str, Any]) -> ProviderUsage:
         UsageWindow(
             id=str(w.get("id") or ""),
             label=str(w.get("label") or ""),
-            used_pct=float(w.get("used_pct") or 0),
+            used_pct=float(w["used_pct"]) if w.get("used_pct") is not None else None,
             resets_at=w.get("resets_at"),
         )
         for w in (d.get("windows") or [])
@@ -2782,6 +2820,7 @@ def _provider_from_dict(d: dict[str, Any]) -> ProviderUsage:
         fetched_at=d.get("fetched_at"),
         summary=d.get("summary"),
         reset_block=d.get("reset_block") if isinstance(d.get("reset_block"), dict) else None,
+        credential_key=d.get("credential_key"),
     )
 
 
@@ -2789,32 +2828,71 @@ def cache_get_provider(provider_id: str) -> ProviderUsage | None:
     raw = (load_usage_cache().get("providers") or {}).get(provider_id)
     if not isinstance(raw, dict):
         return None
-    p = _provider_from_dict(raw)
+    try:
+        p = _provider_from_dict(raw)
+    except (TypeError, ValueError):
+        return None
+    if p.provider_id != provider_id or p.credential_key != provider_credential_key(provider_id):
+        return None
     if not p.windows and not p.summary:
         return None
     p.stale = True
-    p.available = True
     return p
 
 
 def cache_put_provider(p: ProviderUsage) -> None:
-    if not p.available:
+    if not p.available or p.stale or not p.fetched_at:
         return
     if not p.windows and not p.summary:
         return
-    cache = load_usage_cache()
-    providers = cache.setdefault("providers", {})
+    key = provider_credential_key(p.provider_id)
+    if p.credential_key is not None and p.credential_key != key:
+        return
+    p.credential_key = key
     snap = _provider_to_dict(p)
-    snap["stale"] = False
-    snap["error"] = None
-    snap["fetched_at"] = p.fetched_at or datetime.now(timezone.utc).isoformat()
-    providers[p.provider_id] = snap
-    cache["providers"] = providers
-    save_usage_cache(cache)
+    def update(cache):
+        providers = cache.setdefault("providers", {})
+        old = providers.get(p.provider_id) or {}
+        if (old.get('credential_key') == key
+                and _iso_epoch(old.get('fetched_at'), 0) > _iso_epoch(p.fetched_at, 0)):
+            return
+        providers[p.provider_id] = snap
+        cache.setdefault('display_snapshots', {})[p.provider_id] = snap
+    update_usage_cache(update)
+
+
+def display_snapshot(provider_id: str) -> ProviderUsage | None:
+    """Presentation history is never promoted into the router's quota cache."""
+    raw = (load_usage_cache().get('display_snapshots') or {}).get(provider_id)
+    if not isinstance(raw, dict) or raw.get('credential_key') != provider_credential_key(provider_id):
+        return None
+    try:
+        item = _provider_from_dict(raw)
+    except (TypeError, ValueError):
+        return None
+    if item.provider_id != provider_id or not (item.windows or item.summary):
+        return None
+    item.stale = True
+    return item
+
+
+def mark_provider_stale(provider_id: str, error: str) -> None:
+    def update(cache):
+        row = (cache.get('providers') or {}).get(provider_id)
+        if isinstance(row, dict):
+            if row.get('credential_key') != provider_credential_key(provider_id):
+                cache['providers'].pop(provider_id, None)
+                return
+            row['stale'] = True
+            row['error'] = error
+    update_usage_cache(update)
 
 
 def claude_in_backoff(provider_id: str = "claude") -> bool:
-    until = load_usage_cache().get(f"{provider_id}_backoff_until")
+    cache = load_usage_cache()
+    if cache.get(f'{provider_id}_backoff_credential_key') != provider_credential_key(provider_id):
+        return False
+    until = cache.get(f"{provider_id}_backoff_until")
     dt = parse_iso(str(until) if until else None)
     if not dt:
         return False
@@ -2822,16 +2900,15 @@ def claude_in_backoff(provider_id: str = "claude") -> bool:
 
 
 def set_claude_backoff(seconds: int = CLAUDE_429_BACKOFF_SECONDS, *, provider_id: str = "claude") -> None:
-    cache = load_usage_cache()
     until = datetime.now(timezone.utc).timestamp() + seconds
-    cache[f"{provider_id}_backoff_until"] = datetime.fromtimestamp(until, tz=timezone.utc).isoformat()
-    save_usage_cache(cache)
+    update_usage_cache(lambda cache: cache.update({
+        f"{provider_id}_backoff_until": datetime.fromtimestamp(until, tz=timezone.utc).isoformat(),
+        f'{provider_id}_backoff_credential_key': provider_credential_key(provider_id)
+    }))
 
 
 def clear_claude_backoff(provider_id: str = "claude") -> None:
-    cache = load_usage_cache()
-    cache[f"{provider_id}_backoff_until"] = None
-    save_usage_cache(cache)
+    update_usage_cache(lambda cache: cache.update({f"{provider_id}_backoff_until": None}))
 
 
 # ---------------------------------------------------------------------------
@@ -3148,7 +3225,7 @@ def claude_authorized_json(
     timeout: float = 20.0,
     home: Path | None = None,
 ) -> tuple[int, Any]:
-    """Call an Anthropic OAuth endpoint, refreshing the token once on 401/403.
+    """Use CLI-owned credentials read-only; re-read once after a GET auth failure.
 
     Returns status 0 when there are no local credentials at all.
     """
@@ -3168,24 +3245,13 @@ def claude_authorized_json(
     status, payload = call(oauth["accessToken"])
     if status not in (401, 403):
         return status, payload
-    if home is not None:
-        # Claude Code owns isolated accounts\' refresh-token rotation.
-        # Only re-read a token the CLI may have refreshed in the meantime.
-        latest, _ = read_claude_oauth(home)
+    # Both accounts belong to Claude Code. Never compete for rotating refresh
+    # tokens, and never replay a reset claim under a newly signed-in account.
+    if method.upper() == 'GET':
+        latest, _ = read_claude_oauth(home) if home is not None else read_claude_oauth()
         if latest and latest.get("accessToken") != oauth["accessToken"]:
             return call(latest["accessToken"])
-        return status, payload
-    rt = oauth.get("refreshToken")
-    if not rt or not cred_path:
-        return status, payload
-    refreshed = refresh_claude_token(rt)
-    if not refreshed or not refreshed.get("access_token"):
-        return status, payload
-    oauth["accessToken"] = refreshed["access_token"]
-    if refreshed.get("refresh_token"):
-        oauth["refreshToken"] = refreshed["refresh_token"]
-    save_claude_oauth(cred_path, oauth)
-    return call(oauth["accessToken"])
+    return status, payload
 
 
 def claude_organization_uuid(provider_id: str = "claude") -> str | None:
@@ -3410,27 +3476,24 @@ def claim_claude_session_reset(provider_id: str = "claude") -> ClaudeResetClaim:
     )
 
 
-def _claude_rate_limited_usage(provider_id: str = "claude") -> ProviderUsage:
-    """What to show while the usage endpoint answers 429.
-
-    The last good read beats a failed row: the numbers only drift slowly, and
-    the backoff lifts on its own. Past a day old they are too wrong to show.
-    """
-    cached = cache_get_provider(provider_id)
-    if cached is not None and time.time() - _iso_epoch(cached.fetched_at, 0.0) < 86400:
+def stale_provider_usage(provider_id: str, error: str) -> ProviderUsage:
+    mark_provider_stale(provider_id, error)
+    cached = cache_get_provider(provider_id) or display_snapshot(provider_id)
+    if cached is not None and 0 <= time.time() - _iso_epoch(cached.fetched_at, 0.0):
+        cached.stale = True
+        cached.error = error
         return cached
-    return ProviderUsage(
-        provider_id=provider_id,
-        display_name=provider_id,
-        available=False,
-        error="更新失败",
-        stale=True,
-    )
+    return ProviderUsage(provider_id=provider_id, display_name=provider_id,
+                         available=False, error=error, stale=True)
+
+
+def _claude_rate_limited_usage(provider_id: str = "claude") -> ProviderUsage:
+    return stale_provider_usage(provider_id, "限流退避中")
 
 
 def fetch_claude_usage(*, force: bool = False, provider_id: str = "claude") -> ProviderUsage:
     home = CLAUDE_HOME_2 if provider_id == "claude-2" else None
-    if claude_in_backoff(provider_id) and not force:
+    if claude_in_backoff(provider_id):
         return _claude_rate_limited_usage(provider_id)
 
     oauth, _cred_path = read_claude_oauth(home) if home is not None else read_claude_oauth()
@@ -3442,21 +3505,20 @@ def fetch_claude_usage(*, force: bool = False, provider_id: str = "claude") -> P
             error="更新失败",
         )
 
+    source_key = provider_credential_key(provider_id)
     plan = oauth.get("subscriptionType")
     status, payload = (claude_authorized_json(CLAUDE_USAGE_RESET_URL, home=home)
                        if home is not None else claude_authorized_json(CLAUDE_USAGE_RESET_URL))
 
+    if source_key != provider_credential_key(provider_id):
+        return stale_provider_usage(provider_id, '登录凭据已变化，等待下次更新')
     if status == 429:
         set_claude_backoff(provider_id=provider_id)
         return _claude_rate_limited_usage(provider_id)
 
     if status != 200 or not isinstance(payload, dict):
-        return ProviderUsage(
-            provider_id=provider_id,
-            display_name=provider_id,
-            available=False,
-            error="更新失败",
-        )
+        error = "登录凭据需由 Claude Code 更新" if status in (401, 403) else "更新失败"
+        return stale_provider_usage(provider_id, error)
 
     windows: list[UsageWindow] = []
     five = payload.get("five_hour") or {}
@@ -3512,6 +3574,8 @@ def fetch_claude_usage(*, force: bool = False, provider_id: str = "claude") -> P
             )
         )
 
+    if not windows or any(w.used_pct is None or not math.isfinite(w.used_pct) for w in windows):
+        return stale_provider_usage(provider_id, '用量响应缺少有效窗口')
     reset_block = payload.get("cedar_ember")
     result = ProviderUsage(
         provider_id=provider_id,
@@ -3521,6 +3585,7 @@ def fetch_claude_usage(*, force: bool = False, provider_id: str = "claude") -> P
         available=True,
         fetched_at=datetime.now(timezone.utc).isoformat(),
         reset_block=reset_block if isinstance(reset_block, dict) else None,
+        credential_key=source_key,
     )
     clear_claude_backoff(provider_id)
     cache_put_provider(result)
@@ -3590,7 +3655,7 @@ def codex_authorized_json(
     """Call a ChatGPT backend endpoint with the local Codex OAuth token.
 
     Returns the same (status, payload) pair as http_json(); status 0 means the
-    local credential is missing, unusable, or could not be refreshed.
+    local credential is missing. Only the Codex CLI owns token rotation.
     """
     auth, auth_path = read_codex_auth(home)
     if not auth:
@@ -3602,64 +3667,46 @@ def codex_authorized_json(
     if not access:
         return 0, None
 
-    def call(token: str) -> tuple[int, Any]:
+    def call(token: str, account: str | None) -> tuple[int, Any]:
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        if account_id:
-            headers["ChatGPT-Account-ID"] = str(account_id)
+        if account:
+            headers["ChatGPT-Account-ID"] = str(account)
         return http_json(url, method=method, headers=headers, body=body)
 
-    status, payload = call(access)
-    if status in (401, 403):
-        rt = tokens.get("refresh_token")
-        if not rt or not auth_path:
-            return status, payload
-        refreshed = refresh_codex_token(rt)
-        if not refreshed or not refreshed.get("access_token"):
-            return status, payload
-        save_codex_auth(auth_path, auth, refreshed)
-        status, payload = call(refreshed["access_token"])
+    status, payload = call(access, account_id)
+    if status in (401, 403) and method.upper() == 'GET':
+        latest, _ = read_codex_auth(home)
+        new = (latest or {}).get('tokens') or {}
+        if new.get('access_token') and new['access_token'] != access:
+            return call(new['access_token'], new.get('account_id'))
     return status, payload
 
 
 def fetch_codex_usage(account: CodexAccount) -> ProviderUsage:
+    source_key = provider_credential_key(account.provider_id)
     status, payload = codex_authorized_json(CODEX_USAGE_URL, home=account.home)
+    if source_key != provider_credential_key(account.provider_id):
+        return stale_provider_usage(account.provider_id, '登录凭据已变化，等待下次更新')
     if status != 200 or not isinstance(payload, dict):
-        return ProviderUsage(
-            provider_id=account.provider_id,
-            display_name=account.display_name,
-            available=False,
-            error="更新失败",
-        )
+        error = "登录凭据需由 Codex 更新" if status in (401, 403) else "更新失败"
+        return stale_provider_usage(account.provider_id, error)
 
     rate = payload.get("rate_limit") or {}
-    # Prefer the more limiting / primary window for the single-line display.
-    # Use primary if present, else secondary; expose remaining reset of that window.
-    primary = rate.get("primary_window") or {}
-    secondary = rate.get("secondary_window") or {}
-    chosen = primary if primary.get("used_percent") is not None else secondary
-    if chosen.get("used_percent") is None:
-        return ProviderUsage(
-            provider_id=account.provider_id,
-            display_name=account.display_name,
-            available=False,
-            error="更新失败",
-        )
-
-    resets_at = None
-    if chosen.get("reset_at") is not None:
-        try:
-            resets_at = datetime.fromtimestamp(float(chosen["reset_at"]), tz=timezone.utc).isoformat()
-        except Exception:
-            resets_at = None
-
-    windows = [
-        UsageWindow(
-            id="usage",
-            label=account.display_name,
-            used_pct=float(chosen["used_percent"]),
-            resets_at=resets_at,
-        )
-    ]
+    # Preserve both constraints for the router; primary is not always weekly.
+    windows = []
+    for name, default_seconds in (("primary_window", 18000), ("secondary_window", 604800)):
+        window = rate.get(name) or {}
+        used = window.get('used_percent')
+        if used is None:
+            continue
+        seconds = window.get('limit_window_seconds') or default_seconds
+        wid = 'five_hour' if seconds == 18000 else 'usage' if seconds == 604800 else f'usage-{int(seconds / 60)}m'
+        windows.append(UsageWindow(
+            id=wid, label='5h' if seconds == 18000 else '7d' if seconds == 604800 else wid,
+            used_pct=float(used), resets_at=_iso_timestamp(window.get('reset_at')),
+        ))
+    if not windows:
+        return stale_provider_usage(account.provider_id, "更新失败")
     result = ProviderUsage(
         provider_id=account.provider_id,
         display_name=account.display_name,
@@ -3667,6 +3714,7 @@ def fetch_codex_usage(account: CodexAccount) -> ProviderUsage:
         windows=windows,
         available=True,
         fetched_at=datetime.now(timezone.utc).isoformat(),
+        credential_key=source_key,
     )
     cache_put_provider(result)
     return result
@@ -4809,85 +4857,146 @@ def active_providers(configured: list[str] | None = None) -> list[str]:
     return [pid for pid in selected if provider_available(pid)]
 
 
-def fetch_from_unified_interface(
-    hub_url: str | None = None,
-    timeout: float | None = None,
-) -> dict[str, ProviderUsage] | None:
-    """Fetch all provider usages and windows in one roundtrip from Token Monitor's unified interface."""
-    endpoint = TOKEN_MONITOR_HUB_URL if hub_url is None else hub_url
-    if not endpoint:
-        return None
-    fetch_timeout = TOKEN_MONITOR_TIMEOUT if timeout is None else timeout
+def provider_poll_seconds(provider_id: str) -> int:
+    """Local session activity controls quota polling, not the panel layout."""
+    path = Path(os.environ.get('ROUTE_MANAGER_ACTIVITY_FILE') or HOME / '.route-manager' / 'usage-activity.json')
     try:
-        url = f"{endpoint.rstrip('/')}/api/unified-usage"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": f"usage-float/{VERSION}",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=fetch_timeout) as response:
-            if response.status != 200:
-                return None
-            data = json.loads(response.read().decode("utf-8"))
-        if not isinstance(data, dict) or not data.get("ok"):
-            return None
-        raw_providers = data.get("providers")
-        if not isinstance(raw_providers, dict):
-            return None
-        result: dict[str, ProviderUsage] = {}
-        for pid, pdata in raw_providers.items():
-            if not isinstance(pdata, dict):
-                continue
-            item = _provider_from_dict(pdata)
-            if item.available and (item.windows or item.summary):
-                result[pid] = item
-        return result
-    except Exception:
-        return None
+        if path.stat().st_size > 1024 * 1024:
+            return UNKNOWN_ACTIVITY_REFRESH_SECONDS
+        activity = json.loads(path.read_text(encoding='utf-8-sig'))
+        age = time.time() - _iso_epoch(activity.get('generated_at'), 0)
+        workers = activity.get('active_workers')
+        account = (activity.get('accounts') or {}).get(provider_id) or {}
+        if (activity.get('schema') != 'route-manager.activity.v1'
+                or not 0 <= age <= 180 or not isinstance(workers, dict)):
+            return UNKNOWN_ACTIVITY_REFRESH_SECONDS
+        tracked = {'claude', 'claude-2', *CODEX_ACCOUNT_BY_ID, 'grok', 'antigravity'}
+        state = account.get('state')
+        if provider_id not in tracked or state not in ('active', 'idle'):
+            return UNKNOWN_ACTIVITY_REFRESH_SECONDS
+        count = (workers.get(provider_id) or {}).get('count', 0)
+        if state == 'active' and count > 0:
+            return REFRESH_SECONDS
+        if state == 'idle' and count == 0:
+            return IDLE_REFRESH_SECONDS
+        return UNKNOWN_ACTIVITY_REFRESH_SECONDS
+    except (OSError, ValueError, TypeError, AttributeError):
+        return UNKNOWN_ACTIVITY_REFRESH_SECONDS
+
+
+def record_usage_attempt(provider_id: str, key: str | None) -> None:
+    def update(cache):
+        cache.setdefault('attempts', {})[provider_id] = {'at': time.time(), 'credential_key': key}
+    update_usage_cache(update)
 
 
 def fetch_all(providers: list[str], *, force: bool = False) -> list[ProviderUsage]:
-    """Fetch each provider once, however many display items it backs."""
-    providers = list(dict.fromkeys(provider_fetch_id(item) for item in providers))
-    unified_data = None
+    """Interface-only client. A failed Hub never enables direct API fallback."""
+    selected = list(dict.fromkeys(provider_fetch_id(pid) for pid in providers))
+    if not selected:
+        return []
+    result = {}
     try:
-        unified_data = fetch_from_unified_interface()
+        url = TOKEN_MONITOR_HUB_URL.rstrip('/') + '/api/unified-usage'
+        body = None
+        if force:
+            url = TOKEN_MONITOR_HUB_URL.rstrip('/') + '/api/local-usage/refresh'
+            body = json.dumps({'providers': selected}).encode('utf-8')
+        request = urllib.request.Request(url, data=body, headers={
+            'Accept': 'application/json', 'Content-Type': 'application/json',
+            'User-Agent': f'usage-float/{VERSION}',
+        }, method='POST' if force else 'GET')
+        if os.environ.get('TOKEN_MONITOR_SECRET'):
+            request.add_header('Authorization', 'Bearer ' + os.environ['TOKEN_MONITOR_SECRET'])
+        with urllib.request.urlopen(request, timeout=125 if force else TOKEN_MONITOR_TIMEOUT) as response:
+            payload = json.load(response)
+        # v1's generic provider aliases do not identify local account slots.
+        if payload.get('schema') == 'route-manager.local-usage.v1':
+            for pid, raw in (payload.get('providers') or {}).items():
+                if pid not in selected or not isinstance(raw, dict) or raw.get('provider_id') != pid:
+                    continue
+                try:
+                    item = _provider_from_dict(raw)
+                except (ValueError, TypeError):
+                    continue
+                if item.credential_key != provider_credential_key(pid):
+                    continue
+                result[pid] = item
     except Exception:
         pass
+    out = []
+    for pid in selected:
+        item = result.get(pid)
+        if item is None or not item.available:
+            item = cache_get_provider(pid) or display_snapshot(pid) or item
+            if item is not None:
+                item.stale = True  # Display-only fallback; never write a new observation.
+        out.append(item or ProviderUsage(provider_id=pid, display_name=pid, available=False, stale=True, error='更新失败'))
+    return out
 
-    out: list[ProviderUsage] = []
-    for p in providers:
-        if unified_data and p in unified_data:
-            item = unified_data[p]
-            cache_put_provider(item)
-            out.append(item)
+
+def collect_local_usage(providers: list[str], *, force: bool = False) -> list[ProviderUsage]:
+    """Backend adapter only: one account-scoped collection/cache lane.
+
+    Invoked by Token Monitor via tray/usage_backend.py, never by the HUD or
+    the headless interface client. The service owns cadence and activity input.
+    """
+    out = []
+    for pid in dict.fromkeys(provider_fetch_id(item) for item in providers):
+        if pid not in {*PROVIDER_DISPLAY_ITEMS, *CODEX_ACCOUNT_BY_ID, 'grok', 'llmproxy'}:
             continue
         try:
-            if p == "claude":
-                out.append(fetch_claude_usage(force=force))
-            elif p == "claude-2":
-                out.append(fetch_claude_usage(force=force, provider_id=p))
-            elif p in CODEX_ACCOUNT_BY_ID:
-                out.append(fetch_codex_usage(CODEX_ACCOUNT_BY_ID[p]))
-            elif p == "grok":
-                out.append(fetch_grok_usage())
-            elif p == "llmproxy":
-                out.append(fetch_llmproxy_usage())
-            elif p == "antigravity":
-                out.append(fetch_antigravity_usage())
+            with file_lock(CACHE_PATH.with_name(f'{CACHE_PATH.name}.{pid}.fetch.lock'), timeout=1):
+                key = provider_credential_key(pid)
+                cached = cache_get_provider(pid) or display_snapshot(pid)
+                cache = load_usage_cache()
+                raw = (cache.get('providers') or {}).get(pid) or {}
+                attempt = (cache.get('attempts') or {}).get(pid) or {}
+                last_attempt = attempt.get('at', 0) if attempt.get('credential_key') == key else 0
+                observed = _iso_epoch(cached.fetched_at, 0) if cached else 0
+                age = time.time() - max(last_attempt, observed)
+                if not force and 0 <= age < provider_poll_seconds(pid):
+                    if cached:
+                        # Keep exactly the same numbers/titles. Staleness is
+                        # metadata for routing, not an extra panel label.
+                        cached.stale = bool(raw.get('stale', True)) or time.time() - observed >= REFRESH_SECONDS
+                        out.append(cached)
+                    else:
+                        out.append(ProviderUsage(provider_id=pid, display_name=pid,
+                                                 available=False, stale=True, error='更新失败'))
+                    continue
+                record_usage_attempt(pid, key)
+                if pid == 'claude':
+                    item = fetch_claude_usage(force=force)
+                elif pid == 'claude-2':
+                    item = fetch_claude_usage(force=force, provider_id=pid)
+                elif pid in CODEX_ACCOUNT_BY_ID:
+                    item = fetch_codex_usage(CODEX_ACCOUNT_BY_ID[pid])
+                elif pid == 'grok':
+                    item = fetch_grok_usage()
+                elif pid == 'llmproxy':
+                    item = fetch_llmproxy_usage()
+                elif pid == 'antigravity':
+                    item = fetch_antigravity_usage()
+                else:
+                    continue
+                if key != provider_credential_key(pid):
+                    item = stale_provider_usage(pid, '登录凭据已变化，等待下次更新')
+                elif item.available and not item.stale:
+                    item.credential_key = key
+                    cache_put_provider(item)
+                elif item.stale or not item.available:
+                    item = stale_provider_usage(pid, item.error or '更新失败')
+                out.append(item)
+        except TimeoutError:
+            # The other process owns this fetch; don't overwrite its result.
+            item = cache_get_provider(pid) or display_snapshot(pid)
+            if not item or not 0 <= time.time() - _iso_epoch(item.fetched_at, 0):
+                item = ProviderUsage(provider_id=pid, display_name=pid, available=False,
+                                     stale=True, error='正在由其他采集器更新')
+            out.append(item)
         except Exception:
-            out.append(
-                ProviderUsage(
-                    provider_id=p,
-                    display_name=p,
-                    available=False,
-                    error="更新失败",
-                )
-            )
-    order = {pid: i for i, pid in enumerate(providers)}
-    out.sort(key=lambda x: order.get(x.provider_id, 99))
+            out.append(stale_provider_usage(pid, '更新失败'))
     return out
 
 
@@ -5006,9 +5115,13 @@ def _expand_display_rows(providers: list[ProviderUsage]) -> list[DisplayRow]:
             continue
 
         if p.windows:
-            multi = len(p.windows) > 1
+            shown = p.windows
+            if p.provider_id in CODEX_ACCOUNT_BY_ID:
+                # Retain one tile, but expose both constraints to the router.
+                shown = [max(shown, key=lambda w: w.used_pct if w.used_pct is not None else -1)]
+            multi = len(shown) > 1
             # Allow 5h + 7d + scoped model weeks (e.g. fable 7d)
-            for w in p.windows[:5]:
+            for w in shown[:5]:
                 # "claude 5h" / "claude 7d" / "fable 7d" (scoped rows omit provider prefix)
                 if w.id.startswith("weekly_"):
                     title = f"{name} {w.label}" if p.provider_id == "claude-2" else w.label
@@ -7754,11 +7867,9 @@ def run_ui() -> None:
         state["refreshing"] = False
         state["providers"] = providers
         # Mark successful overall refresh time if at least one provider is OK
-        if any(p.available for p in providers):
-            state["last_ok_at"] = time.time()
-        elif state["last_ok_at"] is None:
-            # still stamp attempt time so footer is not empty forever
-            state["last_ok_at"] = time.time()
+        fresh_times = [_iso_epoch(p.fetched_at, 0) for p in providers if p.available and not p.stale]
+        if any(fresh_times):
+            state["last_ok_at"] = max(fresh_times)
         # A data refresh does not change the dedicated panel's native bounds.
         # Avoid SetWindowPos(...SWP_SHOWWINDOW) on every refresh; it needlessly
         # invalidates the full-screen surface on mixed-DPI monitor layouts.
@@ -10837,11 +10948,7 @@ def run_ui() -> None:
 
             def work() -> None:
                 try:
-                    fresh: ProviderUsage | None = (
-                        fetch_claude_usage(force=True, provider_id=account_id)
-                        if account_id == "claude-2"
-                        else fetch_claude_usage(force=True)
-                    )
+                    fresh: ProviderUsage | None = next(iter(fetch_all([account_id], force=True)), None)
                 except Exception:
                     _log_exception("claude reset status")
                     fresh = None
@@ -11945,7 +12052,8 @@ def run_ui() -> None:
 
         root.after(800, _run_docs_shot)
     else:
-        refresh_async(force=True)
+        # Reopening the panel is not a request to re-query every subscription.
+        refresh_async(force=False)
         root.after(interval_ms, tick_refresh)
         root.after(15_000, tick_footer)
     root.mainloop()
